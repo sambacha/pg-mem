@@ -1,6 +1,6 @@
 {
   "name": "pg-mem",
-  "version": "1.0.25",
+  "version": "1.0.3+dev",
   "description": "A memory version of postgres",
   "main": "index.js",
   "scripts": {
@@ -36,7 +36,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "functional-red-black-tree": "^1.0.1",
+    "functional-red-black-tree2": "^1.1.0",
     "immutable": "^4.0.0-rc.12",
     "lru-cache": "^6.0.0",
     "moment": "^2.27.0",
