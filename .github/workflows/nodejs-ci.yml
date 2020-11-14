@@ -22,7 +22,7 @@ jobs:
       run: |
         npm install codecov -g
         npm install
-        npm riun-script test
+        npm run-script test
         npm run-script cover
         codecov
       env:
