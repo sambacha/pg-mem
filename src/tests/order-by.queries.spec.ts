@@ -3,9 +3,8 @@ import 'chai';
 import { newDb } from '../db';
 import { expect, assert } from 'chai';
 import { _IDb } from '../interfaces-private';
-import { preventSeqScan } from './test-utils';
 
-describe('[Queries] Order by', () => {
+describe('Order by', () => {
 
     let db: _IDb;
     let many: (str: string) => any[];
@@ -68,4 +67,60 @@ describe('[Queries] Order by', () => {
                 , { a: null, b: 1 }
             ]);
     });
+
+
+    describe('orders jsonb values', () => {
+        const trues = [
+            ['{}', '>', '[]'],
+            ['{}', '>', '1'],
+            ['[]', '<', '1'],
+            ['{"a":"b"}', '>', '{"a": "a"}'],
+            ['{"a":"a", "b":"c"}', '>=', '{"a": "a"}'],
+            ['{}', '>=', 'null'],
+            ['1', '>=', 'null'],
+            ['[]', '<', 'null'],
+            ['[1, 2]', '>', '[1]'],
+            ['[2, 2]', '>', '[1,2]'],
+            ['null', '=', 'null'],
+        ];
+
+        const falses = [
+            ['{"a":"a"}', '>', '{"a": "a"}'],
+            ['{}', '<', '[]'],
+            ['[]', '>=', 'null'],
+            ['[1, 2]', '>', '[1,2,3]'],
+            ['[2, 2]', '>', '[1,2,3]'],
+            ['[2, 2]', '=', 'null'],
+        ]
+
+        for (const [l, c, r] of trues) {
+            it(`✅ ${l} ${c} ${r}`, () => {
+                expect(one(`select '${l}'::jsonb ${c} '${r}'::jsonb as v`))
+                    .to.deep.equal({ v: true });
+            });
+        }
+
+        for (const [l, c, r] of falses) {
+            it(`⛔ ${l} ${c} ${r}`, () => {
+                expect(one(`select '${l}'::jsonb ${c} '${r}'::jsonb as v`))
+                    .to.deep.equal({ v: false });
+            });
+        }
+
+        it('cannot compare with null', () => {
+            expect(one(`select '{}'::jsonb = null as v`))
+                .to.deep.equal({ v: null });
+            expect(one(`select '{}'::jsonb < null as v`))
+                .to.deep.equal({ v: null });
+            expect(one(`select '{}'::jsonb > null as v`))
+                .to.deep.equal({ v: null });
+            expect(one(`select '[]'::jsonb = null as v`))
+                .to.deep.equal({ v: null });
+            expect(one(`select 'null'::jsonb = null as v`))
+                .to.deep.equal({ v: null });
+            expect(one(`select 'null'::jsonb = null as v`))
+                .to.deep.equal({ v: null });
+        })
+
+    })
 });

@@ -9,27 +9,27 @@ describe('Test utils', () => {
         delete globalThis.process.env['NOCHECKFULLQUERYUSAGE'];
         try {
             {
-                const data = watchUse({ a: 1, b: [{ c: 1 }] });
-                data.a;
-                data.b[0].c;
-                data.check!();
+                const { checked, check } = watchUse({ a: 1, b: [{ c: 1 }] });
+                checked.a;
+                checked.b[0].c;
+                assert.notExists(check!());
             }
-            assert.throws(() => {
-                const data = watchUse({ a: 1, b: [{ c: 1 }] });
-                data.a;
-                data.check!();
-            });
-            assert.throws(() => {
-                const data = watchUse({ a: 1, b: [{ c: 1 }, { d: 1 }] });
-                data.a;
-                data.b[1].c;
-                data.check!();
-            }); {
-
-                const data = watchUse({ a: 1, b: [{ c: 1 }, 5] });
-                data.a;
-                (data.b[0] as any).c;
-                data.check!();
+            {
+                const { checked, check } = watchUse({ a: 1, b: [{ c: 1 }] });
+                checked.a;
+                assert.exists(check!());
+            }
+            {
+                const { checked, check } = watchUse({ a: 1, b: [{ c: 1 }, { d: 1 }] });
+                checked.a;
+                checked.b[1].c;
+                assert.exists(check!());
+            }
+            {
+                const { checked, check } = watchUse({ a: 1, b: [{ c: 1 }, 5] });
+                checked.a;
+                (checked.b[0] as any).c;
+                assert.notExists(check!());
             }
         } finally {
             globalThis.process.env['NOCHECKFULLQUERYUSAGE'] = old;
@@ -45,5 +45,5 @@ describe('Test utils', () => {
         assert.isTrue(queryJson({ a: [1] }, { a: [1, 2, 3] }));
         assert.isTrue(queryJson({ a: [{ b: 'test' }] }, { a: [{ b: 'test', c: 42 }] }));
         assert.isTrue(queryJson({ a: [{ b: 'test' }, { c: 12 }] }, { a: [{ c: 12 }, { b: 'test' }] }));
-    })
+    });
 });

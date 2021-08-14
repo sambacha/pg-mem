@@ -2,12 +2,11 @@ import 'mocha';
 import 'chai';
 import { newDb } from '../db';
 import { expect, assert } from 'chai';
-import { IMemoryDb } from '../interfaces';
 import { preventSeqScan } from './test-utils';
 import { Types } from '../datatypes';
 import { _IDb } from '../interfaces-private';
 
-describe('[Queries] Null values', () => {
+describe('Null values', () => {
 
     let db: _IDb;
     let many: (str: string) => any[];
@@ -28,12 +27,12 @@ describe('[Queries] Null values', () => {
             fields: [{
                 name: 'id',
                 type: Types.text(),
-                constraint: { type: 'primary key' },
+                constraints: [{ type: 'primary key' }],
             }, {
                 name: 'str',
                 type: Types.text(),
             }, {
-                name: 'otherStr',
+                name: 'otherstr',
                 type: Types.text(),
             }],
         });
@@ -77,4 +76,30 @@ describe('[Queries] Null values', () => {
         const got = many('select * from data where str != null');
         expect(got).to.deep.equal([]);
     });
+
+
+    it('can select jsonb null', () => {
+        expect(many(`drop table if exists test;
+        create table test(txt text);
+                        insert into test values ('null'), (null);
+                        select txt::jsonb as casted, txt::jsonb is null as "castedIsNil", txt::jsonb = null as "eqNil", txt::jsonb = 'null'::jsonb as "eqNilJson" from test;`))
+            .to.deep.equal([
+                { casted: null, castedIsNil: false, eqNil: null, eqNilJson: true },
+                { casted: null, castedIsNil: true, eqNil: null, eqNilJson: null },
+            ]);
+
+        expect(many(`select 'null'::jsonb`))
+            .to.deep.equal([{ jsonb: null }]);
+
+        expect(many(`select concat('nu','ll')::jsonb`))
+            .to.deep.equal([{ jsonb: null }]);
+
+        expect(many(`select val, val isnull as "isNil", val = null as "eqNil", val = 'null'::jsonb as "eqNilJson" from (values ('{"abc":null}'::jsonb -> 'abc')) as tbl(val)`))
+            .to.deep.equal([{
+                val: null,
+                isNil: false,
+                eqNil: null,
+                eqNilJson: true,
+            }])
+    })
 });

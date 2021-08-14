@@ -1,14 +1,16 @@
 import moment from 'moment';
 import { List } from 'immutable';
-import { IValue, NotSupported } from './interfaces-private';
-import { SelectedColumn, Expr } from 'pgsql-ast-parser';
+import { IValue, NotSupported, RegClass, _IRelation, _ISchema, _ISelection, _ITable, _IType, _Transaction } from './interfaces-private';
+import { BinaryOperator, DataTypeDef, Expr, ExprRef, ExprValueKeyword, Interval, nil, parse, QName, SelectedColumn } from 'pgsql-ast-parser';
+import { ColumnNotFound, ISubscription, IType, QueryError, typeDefToStr } from './interfaces';
+import { bufClone, bufCompare, isBuf } from './buffer-node';
 
 export interface Ctor<T> extends Function {
     new(...params: any[]): T; prototype: T;
 }
 
-export type Optional<T> = {[key in keyof T]?: T[key]};
-
+export type Optional<T> = { [key in keyof T]?: T[key] };
+export type SRecord<T> = Record<string, T>;
 
 
 export function trimNullish<T>(value: T, depth = 5): T {
@@ -26,7 +28,7 @@ export function trimNullish<T>(value: T, depth = 5): T {
 
     for (const k of Object.keys(value)) {
         const val = (value as any)[k];
-        if (val === undefined || val === null)
+        if (nullIsh(val))
             delete (value as any)[k];
         else
             trimNullish(val, depth - 1);
@@ -35,9 +37,9 @@ export function trimNullish<T>(value: T, depth = 5): T {
 }
 
 
-export function watchUse<T>(rootValue: T): T & { check?(): any; } {
+export function watchUse<T>(rootValue: T): { checked: T; check?: () => string | null; } {
     if (!rootValue || typeof globalThis !== 'undefined' && (globalThis as any)?.process?.env?.['NOCHECKFULLQUERYUSAGE'] === 'true') {
-        return rootValue;
+        return { checked: rootValue };
     }
     if (typeof rootValue !== 'object') {
         throw new NotSupported();
@@ -55,8 +57,12 @@ export function watchUse<T>(rootValue: T): T & { check?(): any; } {
                 .map((x, i) => recurse(x, stack.push(`[${i}]`)));
         }
         // watch object
-        const ret = {};
+        const ret: any = {};
         for (const [k, _v] of Object.entries(value)) {
+            if (k[0] === '_') { // ignore properties starting with '_'
+                ret[k] = _v;
+                continue;
+            }
             const nstack = stack.push('.' + k);
             let v = recurse(_v, nstack);
             const nstackKey = nstack.join('');
@@ -74,14 +80,18 @@ export function watchUse<T>(rootValue: T): T & { check?(): any; } {
 
     const final = recurse(rootValue);
 
-    final['check'] = function () {
+    const check = function () {
         if (toUse.size) {
-            throw new NotSupported('AST query parts have not been read by the query planner.\nPlease file an issue stating the incriminated request, and:\n- ' + [...toUse.entries()]
-                .map(([k, v]) => k + ' (' + JSON.stringify(v) + ')')
-                .join('\n- '));
+            return `The query you ran generated an AST which parts have not been read by the query planner. \
+This means that those parts could be ignored:
+
+    ⇨ ` + [...toUse.entries()]
+                    .map(([k, v]) => k + ' (' + JSON.stringify(v) + ')')
+                    .join('\n    ⇨ ');
         }
+        return null;
     }
-    return final;
+    return { checked: final, check };
 }
 
 
@@ -89,6 +99,7 @@ export function watchUse<T>(rootValue: T): T & { check?(): any; } {
 export function deepEqual<T>(a: T, b: T, strict?: boolean, depth = 10, numberDelta = 0.0001) {
     return deepCompare(a, b, strict, depth, numberDelta) === 0;
 }
+
 export function deepCompare<T>(a: T, b: T, strict?: boolean, depth = 10, numberDelta = 0.0001): number {
     if (depth < 0) {
         throw new NotSupported('Comparing too deep entities');
@@ -107,7 +118,7 @@ export function deepCompare<T>(a: T, b: T, strict?: boolean, depth = 10, numberD
 
     if (Array.isArray(a)) {
         if (!Array.isArray(b)) {
-            return 1;
+            return -1; // [] < {}
         }
         if (a.length !== b.length) {
             return a.length > b.length ? 1 : -1;
@@ -118,6 +129,20 @@ export function deepCompare<T>(a: T, b: T, strict?: boolean, depth = 10, numberD
                 return inner;
         }
         return 0;
+    }
+
+    if (Array.isArray(b)) {
+        return 1;
+    }
+
+    if (isBuf(a) || isBuf(b)) {
+        if (!isBuf(a)) {
+            return 1;
+        }
+        if (!isBuf(b)) {
+            return -1;
+        }
+        return bufCompare(a, b);
     }
 
     // handle dates
@@ -154,19 +179,23 @@ export function deepCompare<T>(a: T, b: T, strict?: boolean, depth = 10, numberD
 
     const fa = Number.isFinite(<any>a);
     const fb = Number.isFinite(<any>b);
-    if (fa || fb) {
+    if (fa && fb) {
         if (Math.abs(<any>a - <any>b) <= numberDelta) {
             return 0;
         }
         return a > b ? 1 : -1;
+    } else if (fa && b) {
+        return -1;
+    } else if (fb && a) {
+        return 1;
     }
 
     // === handle plain objects
     if (typeof a !== 'object') {
-        return -1; // objects are at the end
+        return 1; // objects are at the end
     }
     if (typeof b !== 'object') {
-        return 1; // objects are at the end
+        return -1; // objects are at the end
     }
 
     if (!a || !b) {
@@ -254,26 +283,6 @@ export function queryJson(a: Json, b: Json) {
     return true;
 }
 
-export function buildColumnIds(suggestedIds: string[]) {
-    const exists = new Set(suggestedIds);
-    const got = new Set();
-    let cid = 0;
-    return suggestedIds
-        .map(x => {
-            if (x && !got.has(x)) {
-                got.add(x);
-                return x;
-            }
-            let base = x ?? 'column';
-            let nm: string;
-            do {
-                nm = base + (cid++);
-            } while (exists.has(nm) || got.has(nm));
-            got.add(nm);
-            return nm;
-        });
-}
-
 export function buildLikeMatcher(likeCondition: string, caseSensitive = true) {
     // Escape regex characters from likeCondition
     likeCondition = likeCondition.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
@@ -292,11 +301,15 @@ export function buildLikeMatcher(likeCondition: string, caseSensitive = true) {
     }
 }
 
-export function nullIsh(v: any) {
+export function nullIsh(v: any): boolean {
     return v === null || v === undefined;
 }
-export function hasNullish(...vals: any[]) {
+export function hasNullish(...vals: any[]): boolean {
     return vals.some(nullIsh);
+}
+
+export function sum(v: number[]): number {
+    return v.reduce((sum, el) => sum + el, 0);
 }
 
 export function deepCloneSimple<T>(v: T): T {
@@ -304,7 +317,10 @@ export function deepCloneSimple<T>(v: T): T {
         return v;
     }
     if (Array.isArray(v)) {
-        return v.map(x => deepCloneSimple(x)) as any;
+        return (v as any[]).map(x => deepCloneSimple(x)) as any;
+    }
+    if (isBuf(v)) {
+        return bufClone(v) as any;
     }
 
     const ret: any = {};
@@ -318,10 +334,314 @@ export function deepCloneSimple<T>(v: T): T {
 }
 
 
-export function isSelectAllArgList(select: Expr[]) {
+export function isSelectAllArgList(select: Expr[]): boolean {
     const [first] = select;
     return select.length === 1
         && first.type === 'ref'
         && first.name === '*'
-        // && !first.table
+        && !first.table;
+}
+
+
+export function ignore(...val: any[]): void {
+    for (const v of val) {
+        if (!v) {
+            continue;
+        }
+        if (Array.isArray(v)) {
+            ignore(...v);
+            continue;
+        }
+        if (typeof v !== 'object') {
+            continue;
+        }
+        ignore(...Object.values(v));
+    }
+}
+
+export function combineSubs(...vals: ISubscription[]): ISubscription {
+    return {
+        unsubscribe: () => {
+            vals.forEach(u => u?.unsubscribe());
+        },
+    };
+}
+
+
+interface Ctx {
+    schema: _ISchema;
+    transaction: _Transaction;
+}
+const curCtx: Ctx[] = [];
+export function getContext(): Ctx {
+    if (!curCtx.length) {
+        throw new Error('Cannot call getFunctionContext() in this context');
+    }
+    return curCtx[curCtx.length - 1];
+}
+
+export function pushContext<T>(ctx: Ctx, act: () => T): T {
+    try {
+        curCtx.push(ctx)
+        return act();
+    } finally {
+        curCtx.pop();
+    }
+}
+
+export function indexHash(this: void, vals: (IValue | string)[]) {
+    return vals.map(x => typeof x === 'string' ? x : x.hash).sort().join('|');
+}
+
+export function randomString(length = 8, chars = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'): string {
+    var result = '';
+    for (var i = length; i > 0; --i) result += chars[Math.floor(Math.random() * chars.length)];
+    return result;
+}
+
+
+export function schemaOf(t: DataTypeDef): string | nil {
+    if (t.kind === 'array') {
+        return schemaOf(t.arrayOf);
+    }
+    return t.schema;
+}
+
+
+export function isType(t: any): t is (_IType | IType) {
+    return !!t?.[isType.TAG];
+}
+isType.TAG = Symbol();
+
+
+export function suggestColumnName(expr: Expr | nil): string | null {
+    if (!expr) {
+        return null;
+    }
+    // suggest a column result name
+    switch (expr.type) {
+        case 'call':
+            return expr.function.name;
+        case 'ref':
+            return expr.name;
+        case 'keyword':
+            return expr.keyword;
+        case 'cast':
+            return typeDefToStr(expr.to);
+    }
+    return null;
+}
+
+export function findTemplate<T>(this: void, selection: _ISelection, t: _Transaction, template?: T, columns?: (keyof T)[]): Iterable<T> {
+    // === Build an SQL AST expression that matches
+    // this template
+    let expr: Expr | nil;
+    for (const [k, v] of Object.entries(template ?? {})) {
+        let right: Expr;
+        if (nullIsh(v)) {
+            // handle { myprop: null }
+            right = {
+                type: 'unary',
+                op: 'IS NULL',
+                operand: {
+                    type: 'ref',
+                    name: k,
+                },
+            };
+        } else {
+            let value: Expr;
+            let op: BinaryOperator = '=';
+            switch (typeof v) {
+                case 'number':
+                    // handle {myprop: 42}
+                    value = Number.isInteger(v)
+                        ? { type: 'integer', value: v }
+                        : { type: 'numeric', value: v };
+                    break;
+                case 'string':
+                    // handle {myprop: 'blah'}
+                    value = { type: 'string', value: v };
+                    break;
+                case 'object':
+                    // handle {myprop: new Date()}
+                    if (moment.isMoment(v)) {
+                        value = { type: 'string', value: v.toISOString() };
+                    } else if (v instanceof Date) {
+                        value = { type: 'string', value: moment(v).toISOString() };
+                    } else {
+                        // handle {myprop: {obj: "test"}}
+                        op = '@>';
+                        value = {
+                            type: 'string',
+                            value: JSON.stringify(v),
+                        };
+                    }
+                    break;
+                default:
+                    throw new Error(`Object type of property "${k}" not supported in template`);
+            }
+            right = {
+                type: 'binary',
+                op,
+                left: {
+                    type: 'ref',
+                    name: k,
+                },
+                right: value
+            };
+        }
+        expr = !expr ? right : {
+            type: 'binary',
+            op: 'AND',
+            left: expr,
+            right,
+        };
+    }
+
+    // === perform filter
+    let ret = selection
+        .filter(expr);
+    if (columns) {
+        ret = ret.select(columns.map<SelectedColumn>(x => ({
+            expr: { type: 'ref', name: x as string },
+        })));
+    }
+    return ret.enumerate(t);
+}
+
+
+function ver(v: string) {
+    if (!v || !/^\d+(\.\d+)+$/.test(v)) {
+        throw new Error('Invalid semver ' + v)
+    }
+    return v.split(/\./g).map(x => parseInt(x, 10));
+}
+export function compareVersions(_a: string, _b: string): number {
+    const a = ver(_a);
+    const b = ver(_b);
+    const m = Math.max(a.length, b.length);
+    for (let i = 0; i < m; i++) {
+        const d = (b[i] || 0) - (a[i] || 0);
+        if (d !== 0) {
+            return d;
+        }
+    }
+    return 0;
+}
+
+
+export function intervalToSec(v: Interval) {
+    return (v.milliseconds ?? 0) / 1000
+        + (v.seconds ?? 0)
+        + (v.minutes ?? 0) * 60
+        + (v.hours ?? 0) * 3600
+        + (v.days ?? 0) * 3600 * 24
+        + (v.months ?? 0) * 3600 * 24 * 30
+        + (v.years ?? 0) * 3600 * 24 * 30 * 12;
+}
+
+export function parseRegClass(_reg: RegClass): QName | number {
+    let reg = _reg;
+    if (typeof reg === 'string' && /^\d+$/.test(reg)) {
+        reg = parseInt(reg);
+    }
+    if (typeof reg === 'number') {
+        return reg;
+    }
+    // todo remove casts after next pgsql-ast-parser release
+    try {
+        const ret = parse(reg, 'qualified_name' as any) as QName;
+        return ret;
+    } catch (e) {
+        return { name: reg };
+    }
+}
+
+
+const timeReg = /^(\d+):(\d+)(:(\d+))?(\.\d+)?$/;
+export function parseTime(str: string): moment.Moment {
+    const [_, a, b, __, c, d] = timeReg.exec(str) ?? [];
+    if (!_) {
+        throw new QueryError(`Invalid time format: ` + str);
+    }
+    const ms = d ? parseFloat(d) * 1000 : undefined;
+    let ret: moment.Moment;
+    if (c) {
+        ret = moment.utc({
+            h: parseInt(a, 10),
+            m: parseInt(b, 10),
+            s: parseInt(c, 10),
+            ms,
+        });
+    } else {
+        if (d) {
+            ret = moment.utc({
+                m: parseInt(a, 10),
+                s: parseInt(b, 10),
+                ms,
+            });
+        } else {
+            ret = moment.utc({
+                h: parseInt(a, 10),
+                m: parseInt(b, 10),
+                ms,
+            });
+        }
+    }
+    if (!ret.isValid()) {
+        throw new QueryError(`Invalid time format: ` + str);
+    }
+    return ret;
+}
+
+
+export function colByName<T>(refs: Map<string, T>, ref: string | ExprRef, nullIfNotFound: boolean | nil): T | nil {
+    const nm = typeof ref === 'string' ? ref
+        : !ref.table ? ref.name
+            : null;
+    const got = nm ? refs.get(nm) : null;
+    if (!got && !nullIfNotFound) {
+        throw new ColumnNotFound(colToStr(ref));
+    }
+    return got;
+}
+
+export function colToStr(col: string | ExprRef) {
+    if (typeof col === 'string') {
+        return col;
+    }
+    if (!col.table) {
+        return col.name;
+    }
+    return col.table.name + '.' + col.name;
+}
+
+export function qnameToStr(col: string | QName) {
+    if (typeof col === 'string') {
+        return col;
+    }
+    if (!col.schema) {
+        return col.name;
+    }
+    return col.schema + '.' + col.name;
+}
+
+export function asSingleName(col: string | ExprRef): string | nil {
+    if (typeof col === 'string') {
+        return col;
+    }
+    if (col.table) {
+        return null;
+    }
+    return col.name;
+}
+
+export function asSingleQName(col: string | QName, allowedSchema?: string): string | nil {
+    if (typeof col === 'string') {
+        return col;
+    }
+    if (col.schema && col.schema !== allowedSchema) {
+        return null;
+    }
+    return col.name;
 }

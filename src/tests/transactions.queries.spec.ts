@@ -3,10 +3,9 @@ import 'chai';
 import { newDb } from '../db';
 import { expect, assert } from 'chai';
 import { IMemoryDb } from '../interfaces';
-import { preventSeqScan } from './test-utils';
 import { Types } from '../datatypes';
 
-describe('[Queries] Transactions', () => {
+describe('Transactions', () => {
 
     let db: IMemoryDb;
     let many: (str: string) => any[];
@@ -27,12 +26,12 @@ describe('[Queries] Transactions', () => {
             fields: [{
                 name: 'id',
                 type: Types.text(),
-                constraint: { type: 'primary key' },
+                constraints: [{ type: 'primary key' }],
             }, {
                 name: 'str',
                 type: Types.text(),
             }, {
-                name: 'otherStr',
+                name: 'otherstr',
                 type: Types.text(),
             }],
         });

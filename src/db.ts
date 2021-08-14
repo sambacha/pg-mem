@@ -1,6 +1,6 @@
-import { Schema, IMemoryDb, ISchema, TableEvent, GlobalEvent, TableNotFound, QueryError, IBackup, MemoryDbOptions, ISubscription } from './interfaces';
-import { _IDb, _ISelection, _ITable, _Transaction, _ISchema } from './interfaces-private';
-import { Query } from './query';
+import { Schema, IMemoryDb, ISchema, TableEvent, GlobalEvent, QueryError, IBackup, MemoryDbOptions, ISubscription, LanguageCompiler } from './interfaces';
+import { _IDb, _ISelection, _ITable, _Transaction, _ISchema, _FunctionDefinition, GLOBAL_VARS } from './interfaces-private';
+import { DbSchema } from './schema';
 import { initialize } from './transforms/transform-base';
 import { buildSelection } from './transforms/selection';
 import { buildAlias } from './transforms/alias';
@@ -9,7 +9,13 @@ import { Adapters } from './adapters';
 import { Transaction } from './transaction';
 import { buildGroupBy } from './transforms/aggregation';
 import { buildLimit } from './transforms/limit';
+import { buildUnion } from './transforms/union';
+import { buildDistinct } from './transforms/distinct';
 import { buildOrderBy } from './transforms/order-by';
+import { setupPgCatalog } from './schema/pg-catalog';
+import { setupInformationSchema } from './schema/information-schema';
+import { QName } from 'pgsql-ast-parser';
+import { asSingleQName } from './utils';
 
 export function newDb(opts?: MemoryDbOptions): IMemoryDb {
     initialize({
@@ -18,9 +24,18 @@ export function newDb(opts?: MemoryDbOptions): IMemoryDb {
         buildFilter,
         buildGroupBy,
         buildLimit,
+        buildUnion,
         buildOrderBy,
+        buildDistinct,
     });
-    return new MemoryDb(Transaction.root(), undefined, opts ?? {});
+    // root transaction
+    const root = Transaction.root();
+    const globals = root.getMap(GLOBAL_VARS)
+        .set('server_version', '12.2 (pg-mem)');
+    root.set(GLOBAL_VARS, globals);
+
+    // create db
+    return new MemoryDb(root, undefined, opts ?? {});
 }
 
 class MemoryDb implements _IDb {
@@ -31,13 +46,17 @@ class MemoryDb implements _IDb {
     schemaVersion = 1;
 
     readonly adapters: Adapters = new Adapters(this);
+    private extensions: { [name: string]: (schema: ISchema) => void } = {};
+    private languages: { [name: string]: LanguageCompiler } = {};
+    readonly searchPath = ['pg_catalog', 'public'];
+
     get public() {
         return this.getSchema(null)
     }
 
     onSchemaChange() {
         this.schemaVersion++;
-        this.raiseGlobal('schema-change');
+        this.raiseGlobal('schema-change', this);
     }
 
     constructor(public data: Transaction, schemas?: Map<string, _ISchema>, readonly options: MemoryDbOptions = {}) {
@@ -46,33 +65,69 @@ class MemoryDb implements _IDb {
         } else {
             this.schemas = schemas;
         }
-        this.declareSchema('information_schema')
-            .informationSchma();
+        setupPgCatalog(this);
+        setupInformationSchema(this);
     }
 
     backup(): IBackup {
         return new Backup(this);
     }
 
-    declareSchema(name: string) {
+    registerExtension(name: string, install: (schema: ISchema) => void): this {
+        this.extensions[name] = install;
+        return this;
+    }
+
+    registerLanguage(languageName: string, compiler: LanguageCompiler): this {
+        this.languages[languageName.toLowerCase()] = compiler;
+        return this;
+    }
+
+    getLanguage(name: string): LanguageCompiler {
+        const ret = this.languages[name.toLowerCase()];
+        if (!ret) {
+            throw new QueryError(`Unkonwn language "${name}". If you plan to use a script language, you must declare it to pg-mem via ".registerLanguage()"`);
+        }
+        return ret;
+    }
+
+
+    getExtension(name: string): (schema: ISchema) => void {
+        const ret = this.extensions[name];
+        if (!ret) {
+            throw new Error('Extension does not exist: ' + name);
+        }
+        return ret;
+    }
+
+
+    createSchema(name: string): DbSchema {
         if (this.schemas.has(name)) {
             throw new Error('Schema exists: ' + name);
         }
         this.onSchemaChange();
-        const ret = new Query(name, this);
+        const ret = new DbSchema(name, this);
         this.schemas.set(name, ret);
         return ret;
-    }
-
-    createSchema(name: string) {
-        return this.declareSchema(name)
-            .pgSchema();
     }
 
     getTable(name: string): _ITable;
     getTable(name: string, nullIfNotExists?: boolean): _ITable | null {
         return this.public.getTable(name, nullIfNotExists);
     }
+
+    *getFunctions(name: string | QName, arrity: number): Iterable<_FunctionDefinition> {
+        const asSingle = asSingleQName(name);
+        if (asSingle) {
+            for (const sp of this.searchPath) {
+                yield* this.getSchema(sp).getFunctions(name, arrity, true);
+            }
+        } else {
+            const q = name as QName;
+            yield* this.getSchema(q.schema!).getFunctions(q.name, arrity, true);
+        }
+    }
+
 
     on(event: GlobalEvent | TableEvent, handler: (...args: any[]) => any): ISubscription {
         let lst = this.handlers.get(event);
@@ -99,10 +154,16 @@ class MemoryDb implements _IDb {
         }
     }
 
-    getSchema(db?: string | null): _ISchema {
+
+    getSchema(db?: string | null, nullIfNotFound?: false): _ISchema;
+    getSchema(db: string, nullIfNotFound: true): _ISchema | null;
+    getSchema(db?: string | null, nullIfNotFound?: boolean): _ISchema | null {
         db = db ?? 'public';
         const got = this.schemas.get(db);
         if (!got) {
+            if (nullIfNotFound) {
+                return null;
+            }
             throw new QueryError('schema not found: ' + db);
         }
         return got;

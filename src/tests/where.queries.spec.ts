@@ -7,7 +7,7 @@ import { Types } from '../datatypes';
 import { preventSeqScan } from './test-utils';
 import { IMemoryDb } from '../interfaces';
 
-describe('[Queries] Where', () => {
+describe('Where', () => {
 
     let db: IMemoryDb;
     let many: (str: string) => any[];
@@ -24,12 +24,12 @@ describe('[Queries] Where', () => {
             fields: [{
                 name: 'id',
                 type: Types.text(),
-                constraint: { type: 'primary key' },
+                constraints: [{ type: 'primary key' }],
             }, {
                 name: 'str',
                 type: Types.text(),
             }, {
-                name: 'otherStr',
+                name: 'otherstr',
                 type: Types.text(),
             }],
         });

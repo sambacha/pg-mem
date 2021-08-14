@@ -1,22 +1,24 @@
 import { TransformBase } from './transform-base';
-import { _ISelection, _Transaction, IValue, _IIndex, _Explainer, _SelectExplanation, _IType, IndexKey, _ITable, Stats } from '../interfaces-private';
-import { SelectedColumn, Expr } from 'pgsql-ast-parser';
-import { buildValue } from '../predicate';
+import { _ISelection, _Transaction, IValue, _IIndex, _Explainer, _SelectExplanation, _IType, IndexKey, _ITable, Stats, AggregationComputer, AggregationGroupComputer } from '../interfaces-private';
+import { SelectedColumn, Expr, ExprRef, ExprCall } from 'pgsql-ast-parser';
+import { buildValue } from '../expression-builder';
 import { ColumnNotFound, nil, NotSupported, QueryError } from '../interfaces';
-import { isSelectAllArgList, nullIsh } from '../utils';
+import { colByName, suggestColumnName } from '../utils';
 import hash from 'object-hash';
-import { Evaluator } from '../valuetypes';
-import { Types } from '../datatypes';
+import { Evaluator } from '../evaluator';
+import { buildCount } from './aggregations/count';
+import { buildMinMax } from './aggregations/max-min';
+import { buildSum } from './aggregations/sum';
+import { buildArrayAgg } from './aggregations/array_agg';
+import { buildAvg } from './aggregations/avg';
 
 export const aggregationFunctions = new Set([
-    'array_agg',
     'array_agg',
     'avg',
     'bit_and',
     'bit_or',
     'bool_and',
     'bool_or',
-    'count',
     'count',
     'every',
     'json_agg',
@@ -33,25 +35,6 @@ export const aggregationFunctions = new Set([
 export function buildGroupBy(on: _ISelection, groupBy: Expr[], select: SelectedColumn[]) {
     const group = groupBy.map(x => buildValue(on, x));
     return new Aggregation(on, group, select);
-}
-
-interface AggregationComputer<TRet = any> {
-    readonly type: _IType;
-    /**  Compute from index  (ex: count(*) with a group-by) */
-    computeFromIndex?(key: IndexKey, index: _IIndex, t: _Transaction): TRet | undefined;
-    /**  Compute out of nowhere when there is no group
-     * (ex: when there is no grouping, count(*) on a table or count(xxx) when there is an index on xxx) */
-    computeNoGroup?(t: _Transaction): TRet | undefined;
-
-    /** When iterating, each new group will have its computer */
-    createGroup(t: _Transaction): AggregationGroupComputer<TRet>;
-}
-
-interface AggregationGroupComputer<TRet = any> {
-    /** When iterating, this will be called for each item in this group  */
-    feedItem(item: any): void;
-    /** Finish computation (sets aggregation on result) */
-    finish(): TRet;
 }
 
 export class Aggregation<T> extends TransformBase<T> implements _ISelection<T> {
@@ -81,9 +64,9 @@ export class Aggregation<T> extends TransformBase<T> implements _ISelection<T> {
             const i = _i;
             const g = groupedBy[i];
             this.groupByMapping.set(g.hash!, new Evaluator(
-                g.type
+                on.ownerSchema
+                , g.type
                 , g.id
-                , g.sql
                 , g.hash!
                 , [g]
                 , v => v[this.symbol][i]
@@ -99,10 +82,14 @@ export class Aggregation<T> extends TransformBase<T> implements _ISelection<T> {
         this.building = 'select';
         for (const s of select) {
             const built = buildValue(this, s.expr);
-            if (s.alias && cols.has(s.alias)) {
+            if (s.alias && cols.has(s.alias.name)) {
                 throw new NotSupported('Ambiguous aliasing');
             }
-            cols.set(s.alias ?? built.id ?? ('column' + (anonymous++)), built);
+            const name = s.alias?.name
+                ?? suggestColumnName(s.expr)
+                ?? built.id
+                ?? ('column' + (anonymous++));
+            cols.set(name, built);
         }
         this.building = null;
         this.columnsById = cols;
@@ -206,6 +193,23 @@ export class Aggregation<T> extends TransformBase<T> implements _ISelection<T> {
             }
         }
 
+        // if this.base is empty, and this is not a group by...
+        //  👉 Must return a result.
+        //   ex:
+        //      - select max(a) from empty              👉 [{max: null}]
+        //      - select max(a) from empty group by id  👉 []
+        if (groups.size === 0 && !this.groupedBy.length) {
+            const key: IndexKey = this.groupedBy.map(() => null);
+            const groupingKey = hash(key);
+            groups.set(groupingKey, {
+                key,
+                aggs: aggs.map(x => ({
+                    id: x.id,
+                    computer: x.computer.createGroup(t),
+                })),
+            });
+        }
+
         // === return results
         for (const g of groups.values()) {
             const ret: any = { [this.symbol]: g.key };
@@ -248,38 +252,32 @@ export class Aggregation<T> extends TransformBase<T> implements _ISelection<T> {
         return this.groupByMapping.get(got.hash!) ?? got;
     }
 
-    getColumn(column: string): IValue;
-    getColumn(column: string, nullIfNotFound?: boolean): IValue | nil;
-    getColumn(column: string, nullIfNotFound?: boolean): IValue<any> | nil {
+    getColumn(column: string | ExprRef): IValue;
+    getColumn(column: string | ExprRef, nullIfNotFound?: boolean): IValue | nil;
+    getColumn(column: string | ExprRef, nullIfNotFound?: boolean): IValue<any> | nil {
         if (this.building) {
             // when building, expressions are built agains "this"
             // => must check if parent column exists (might be aliased => cannot check by name)
             return this.base.getColumn(column, nullIfNotFound);
         } else {
             // normal behiavour (get columns from "exterior")
-            const got = this.columnsById.get(column);
-            if (!got) {
-                if (nullIfNotFound) {
-                    return null;
-                }
-                throw new ColumnNotFound(column);
-            }
-            return got;
+            return colByName(this.columnsById, column, nullIfNotFound);
         }
     }
 
-    getAggregation(name: string, args: Expr[]): IValue {
-        const hashed = hash({ name, args });
+    getAggregation(name: string, call: ExprCall): IValue {
+        const hashed = hash(call);
         const agg = this.aggregations.get(hashed);
         if (agg) {
             return agg.getter;
         }
-        const got = this._getAggregation(name, args);
+        const got = this._getAggregation(name, call);
 
         const id = Symbol();
-        const getter = new Evaluator(got.type
+        const getter = new Evaluator(
+            this.ownerSchema
+            , got.type
             , null
-            , name
             , hashed
             , []
             , raw => raw[id]
@@ -295,17 +293,19 @@ export class Aggregation<T> extends TransformBase<T> implements _ISelection<T> {
         return getter;
     }
 
-    private _getAggregation(name: string, args: Expr[]): AggregationComputer {
+    private _getAggregation(name: string, call: ExprCall): AggregationComputer {
         switch (name) {
             case 'count':
-                if (isSelectAllArgList(args)) {
-                    return new CountStar(this.base);
-                }
-                if (args.length !== 1) {
-                    throw new QueryError('COUNT expects one argument, given ' + args.length);
-                }
-                const what = buildValue(this.base, args[0]);
-                return new CountExpr(what);
+                return buildCount(this.base, call);
+            case 'max':
+            case 'min':
+                return buildMinMax(this.base, call.args, name);
+            case 'sum':
+                return buildSum(this.base, call);
+            case 'array_agg':
+                return buildArrayAgg(this.base, call);
+            case 'avg':
+                return buildAvg(this.base, call);
             default:
                 throw new NotSupported('aggregation function ' + name);
         }
@@ -329,56 +329,4 @@ export class Aggregation<T> extends TransformBase<T> implements _ISelection<T> {
         }
     }
 
-}
-
-
-class CountStar implements AggregationComputer<number> {
-
-    constructor(private on: _ISelection) {
-    }
-
-    get type(): _IType<any> {
-        return Types.long;
-    }
-
-    computeFromIndex(key: IndexKey, index: _IIndex<any>, t: _Transaction) {
-        const stats = index.stats(t, key);
-        return stats?.count;
-    }
-
-    computeNoGroup(t: _Transaction) {
-        return this.on.stats(t)?.count;
-    }
-
-    createGroup(): AggregationGroupComputer<number> {
-        let cnt = 0;
-        return {
-            feedItem: () => cnt++,
-            finish: () => cnt,
-        };
-    }
-
-}
-
-class CountExpr implements AggregationComputer<number> {
-
-    constructor(private exp: IValue) {
-    }
-
-    get type(): _IType<any> {
-        return Types.long;
-    }
-
-    createGroup(t: _Transaction): AggregationGroupComputer<number> {
-        let cnt = 0;
-        return {
-            feedItem: (item) => {
-                const value = this.exp.get(item, t);
-                if (!nullIsh(value)) {
-                    cnt++;
-                }
-            },
-            finish: () => cnt,
-        };
-    }
 }

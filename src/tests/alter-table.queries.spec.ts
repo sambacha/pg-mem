@@ -2,19 +2,13 @@ import 'mocha';
 import 'chai';
 import { newDb } from '../db';
 import { expect, assert } from 'chai';
-import { trimNullish } from '../utils';
-import { Types } from '../datatypes';
-import { preventSeqScan } from './test-utils';
 import { IMemoryDb } from '../interfaces';
 
-describe('[Queries] Alter table', () => {
+describe('Alter table', () => {
 
     let db: IMemoryDb;
     let many: (str: string) => any[];
     let none: (str: string) => void;
-    function all(table = 'data') {
-        return many(`select * from ${table}`);
-    }
     beforeEach(() => {
         db = newDb();
         many = db.public.many.bind(db.public);
@@ -32,6 +26,21 @@ describe('[Queries] Alter table', () => {
         alter table test rename to newtable;
         select * from newtable;
         `)).to.deep.equal([{ a: 'a' }])
+    });
+
+
+    it('removes unreferences column when dropped it (bugfix)', () => {
+        expect(many(`CREATE TABLE foo (
+            uuid   VARCHAR NOT NULL,
+            other text
+        );
+
+        SELECT * from information_schema.columns where table_name='foo'; -- This shows uuid as expected
+
+        ALTER TABLE foo DROP COLUMN uuid;
+
+        SELECT column_name from information_schema.columns where table_name='foo'; -- This should not show uuid anymore, but it does`))
+            .to.deep.equal([{column_name: 'other'}])
     });
 
     it('can rename column', () => {
@@ -145,4 +154,30 @@ describe('[Queries] Alter table', () => {
         expect(db.getTable('test').listIndices())
             .to.deep.equal([]);
     });
+
+    it('cannot add generated on a nullable column', () => {
+        assert.throws(() => none(`create table city(name text, city_id int);
+            ALTER TABLE public.city ALTER COLUMN city_id ADD GENERATED ALWAYS AS IDENTITY;`)
+            , /column "city_id" of relation "city" must be declared NOT NULL before identity can be added/);
+    })
+
+    it('can add generated column', () => {
+        // https://github.com/oguimbal/pg-mem/issues/9
+        const data = many(`create table city(name text, city_id int not null);
+                ALTER TABLE public.city ALTER COLUMN city_id ADD GENERATED ALWAYS AS IDENTITY (
+                    SEQUENCE NAME public.city_city_id_seq
+                    START WITH 0
+                    INCREMENT BY 1
+                    MINVALUE 0
+                    NO MAXVALUE
+                    CACHE 1
+                );
+                insert into city(name) values ('Paris'), ('London');
+                select * from city;`);
+
+        expect(data).to.deep.equal([
+            { name: 'Paris', city_id: 0 },
+            { name: 'London', city_id: 1 },
+        ])
+    })
 });

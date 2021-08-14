@@ -1,9 +1,12 @@
-import { _ISelection, IValue, _IIndex, _IDb, setId, getId, _Transaction, _ISchema, _SelectExplanation, _Explainer, IndexExpression, IndexOp, IndexKey, _IndexExplanation, Stats } from '../interfaces-private';
-import { buildValue, uncache } from '../predicate';
-import { QueryError, ColumnNotFound, DataType, NotSupported, nil } from '../interfaces';
-import { DataSourceBase } from './transform-base';
-import { Expr, ExprBinary } from 'pgsql-ast-parser';
-import { nullIsh } from '../utils';
+import { _ISelection, IValue, _IIndex, _IDb, setId, getId, _Transaction, _ISchema, _SelectExplanation, _Explainer, IndexExpression, IndexOp, IndexKey, _IndexExplanation, Stats, _IAlias, TR } from '../interfaces-private';
+import { buildBinaryValue, buildValue, uncache } from '../expression-builder';
+import { QueryError, ColumnNotFound, NotSupported, nil, DataType } from '../interfaces';
+import { DataSourceBase, TransformBase } from './transform-base';
+import { Expr, ExprRef, JoinClause, Name, SelectedColumn } from 'pgsql-ast-parser';
+import { colToStr, nullIsh, SRecord } from '../utils';
+import { Types } from '../datatypes';
+import { SELECT_ALL } from '../clean-results';
+import { CustomAlias, Selection } from './selection';
 
 let jCnt = 0;
 
@@ -19,6 +22,11 @@ interface JoinStrategy {
     othersPredicate?: IValue<any>;
 }
 
+interface Equality {
+    left: IValue;
+    right: IValue;
+    eq: IValue;
+}
 
 function* extractAnds(this: void, on: Expr): Iterable<Expr> {
     if (on.type === 'binary' && on.op === 'AND') {
@@ -37,7 +45,7 @@ function chooseStrategy(this: void, t: _Transaction, strategies: JoinStrategy[])
 export class JoinSelection<TLeft = any, TRight = any> extends DataSourceBase<JoinRaw<TLeft, TRight>> {
 
     private _columns: IValue<any>[] = [];
-    private seqScanExpression: IValue<any>;
+    private seqScanExpression!: IValue<any>;
     private joinId: number;
     private columnsMappingParentToThis = new Map<IValue, IValue>();
     private columnsMappingThisToParent = new Map<IValue, {
@@ -47,6 +55,8 @@ export class JoinSelection<TLeft = any, TRight = any> extends DataSourceBase<Joi
     private indexCache = new Map<IValue, _IIndex>();
     strategies: JoinStrategy[] = [];
     private building = false;
+    private ignoreDupes?: Set<IValue>;
+    private mergeSelect?: Selection;
 
 
     isOriginOf(a: IValue<any>): boolean {
@@ -55,14 +65,6 @@ export class JoinSelection<TLeft = any, TRight = any> extends DataSourceBase<Joi
 
     get columns(): IValue<any>[] {
         return this._columns;
-    }
-
-    private get restrictiveColumns() {
-        return this.restrictive.columns
-    }
-
-    private get joinedColumns() {
-        return this.joined.columns
     }
 
     entropy(t: _Transaction): number {
@@ -80,75 +82,139 @@ export class JoinSelection<TLeft = any, TRight = any> extends DataSourceBase<Joi
     constructor(db: _ISchema
         , readonly restrictive: _ISelection<TLeft>
         , readonly joined: _ISelection<TRight>
-        , on: Expr
+        , on: JoinClause
         , private innerJoin: boolean) {
         super(db);
 
-        if (!on) {
-            throw new Error('Unspecified join ON clause');
-        }
 
         this.joinId = jCnt++;
-        for (const c of this.restrictiveColumns) {
+        for (const c of this.restrictive.listSelectableIdentities()) {
             const nc = c.setWrapper(this, x => (x as any)['>restrictive']);
-            this._columns.push(nc);
             this.columnsMappingParentToThis.set(c, nc);
+            if (c.type.primary === DataType.record) {
+                continue;
+            }
+            this._columns.push(nc);
             this.columnsMappingThisToParent.set(nc, {
                 col: c,
                 side: 'restrictive'
             });
-            this.columnsMappingParentToThis
         }
-        for (const c of this.joinedColumns) {
+        for (const c of this.joined.listSelectableIdentities()) {
             const nc = c.setWrapper(this, x => (x as any)['>joined']);
-            this._columns.push(nc);
             this.columnsMappingParentToThis.set(c, nc);
+            if (c.type.primary === DataType.record) {
+                continue;
+            }
+            this._columns.push(nc);
             this.columnsMappingThisToParent.set(nc, {
                 col: c,
                 side: 'joined',
             });
         }
 
-        this.fetchStrategies(on);
-
-        uncache(this);
-        this.seqScanExpression = buildValue(this, on).convert(DataType.bool);
+        if (on.on) {
+            this.fetchOnStrategies(on.on);
+        } else if (on.using?.length) {
+            this.fetchUsingStrategies(on.using);
+        } else {
+            throw new Error('Unspecified join ON clause');
+        }
     }
 
-    private fetchStrategies(on: Expr) {
-        const all = [...extractAnds(on)];
-        for (let i = 0; i < all.length; i++) {
-            const thisOne = all[i];
-            const strats = [...this.fetchEqStrategy(thisOne)];
+    private wrap(v: IValue) {
+        const ret = this.columnsMappingParentToThis.get(v);
+        if (!ret) {
+            throw new Error('Corrupted join (unknown column)');
+        }
+        return ret;
+    }
+
+    listSelectableIdentities(): Iterable<IValue> {
+        return this.columnsMappingParentToThis.values();
+    }
+
+    private fetchOnStrategies(_on: Expr) {
+        // build equalities eligible to a strategy
+        const ands: Equality[] = [];
+        const others: IValue[] = [];
+        for (const on of extractAnds(_on)) {
+            if (on.type !== 'binary' || on.op !== '=') {
+                // join 'ON' clause not compatible with an indexed strategy
+                others.push(buildValue(this, on));
+                continue;
+            }
+            this.building = true;
+            const left = buildValue(this, on.left);
+            const right = buildValue(this, on.right);
+            this.building = false;
+            // necessary because of the 'this.building' hack
+            uncache(this);
+            ands.push({
+                left,
+                right,
+                eq: buildValue(this, on),
+            });
+        }
+
+        // compute strategies
+        this.fetchAndStrategies(ands, others);
+
+
+        // build seq-scan expression
+        this.seqScanExpression = buildValue(this, _on).convert(Types.bool);
+    }
+
+    private fetchUsingStrategies(_using: Name[]) {
+        // build equalities eligible to a strategy
+        const ands = _using.map<Equality>(n => {
+            const left = this.restrictive.getColumn(n.name);
+            const right = this.joined.getColumn(n.name);
+            return {
+                left,
+                right,
+                eq: buildBinaryValue(this
+                    , this.wrap(left)
+                    , '='
+                    , this.wrap(right))
+            }
+        });
+        this.ignoreDupes = new Set(ands.map(x => this.wrap(x.left)));
+
+        // compute strategies
+        this.fetchAndStrategies(ands, []);
+
+        // build seq-scan expression
+        this.seqScanExpression = ands.slice(1)
+            .reduce((a, b) => buildBinaryValue(this, a, 'AND', b.eq), ands[0].eq);
+    }
+
+    private fetchAndStrategies(ands: Equality[], otherPredicates: IValue[]) {
+
+        for (let i = 0; i < ands.length; i++) {
+            const { left, right } = ands[i];
+            const strats = [...this.fetchEqStrategyOn(left, right)];
             if (!strats.length) {
                 continue;
             }
-            const others = [...all.slice(0, i), ...all.slice(i + 1)];
+            const others = [
+                ...ands.slice(0, i).map(x => x.eq),
+                ...ands.slice(i + 1).map(x => x.eq),
+                ...otherPredicates
+            ];
             if (others.length) {
                 const and = others.slice(1)
-                    .reduce<Expr>((v, c) => ({
-                        type: 'binary',
-                        left: c,
-                        right: v,
-                        op: 'AND',
-                    }), others[0]);
-                const othersPredicate = buildValue(this, and);
+                    .reduce<IValue>((v, c) => buildBinaryValue(this, c, 'AND', v)
+                        , others[0]);
                 for (const s of strats) {
-                    s.othersPredicate = othersPredicate;
+                    s.othersPredicate = and;
                 }
             }
             this.strategies.push(...strats);
         }
     }
 
-    private *fetchEqStrategy(on: Expr): Iterable<JoinStrategy> {
-        if (on.type !== 'binary' || on.op !== '=') {
-            return;
-        }
-        this.building = true;
-        const a = buildValue(this, on.left);
-        const b = buildValue(this, on.right);
-        this.building = false;
+    private *fetchEqStrategyOn(a: IValue, b: IValue): Iterable<JoinStrategy> {
         let restrictedVal: IValue | undefined = undefined;
         let joinedVal: IValue | undefined = undefined;
 
@@ -186,28 +252,29 @@ export class JoinSelection<TLeft = any, TRight = any> extends DataSourceBase<Joi
         }
     }
 
-    getColumn(column: string): IValue;
-    getColumn(column: string, nullIfNotFound?: boolean): IValue | nil;
-    getColumn(column: string, nullIfNotFound?: boolean): IValue<any> | nil {
+    getColumn(column: string | ExprRef): IValue;
+    getColumn(column: string | ExprRef, nullIfNotFound?: boolean): IValue | nil;
+    getColumn(column: string | ExprRef, nullIfNotFound?: boolean): IValue<any> | nil {
         let onLeft = this.restrictive.getColumn(column, true);
         let onRight = this.joined.getColumn(column, true);
         if (!onLeft && !onRight) {
             if (nullIfNotFound) {
                 return null;
             }
-            throw new ColumnNotFound(column);
+            throw new ColumnNotFound(colToStr(column));
         }
         if (!!onLeft && !!onRight) {
-            throw new QueryError(`column reference "${column}" is ambiguous`);
+            throw new QueryError(`column reference "${colToStr(column)}" is ambiguous`);
         }
+        const on = onLeft ?? onRight;
         if (this.building) {
-            return onLeft ?? onRight;
+            return on;
         }
-        const mapped = this.columnsMappingParentToThis.get(onLeft ?? onRight!);
-        if (!mapped) {
-            throw new Error('Corrupted join');
+        const mapped = this.columnsMappingParentToThis.get(on!);
+        if (mapped) {
+            return mapped;
         }
-        return mapped;
+        throw new Error('Corrupted join');
     }
 
     stats(t: _Transaction): Stats | null {
@@ -224,12 +291,25 @@ export class JoinSelection<TLeft = any, TRight = any> extends DataSourceBase<Joi
             }
         } else {
             // perform a seq scan
-            this.schema.db.raiseGlobal('catastrophic-join-optimization');
+            this.db.raiseGlobal('catastrophic-join-optimization');
             const others = [...this.joined.enumerate(t)];
             for (const l of this.restrictive.enumerate(t)) {
                 yield* this.iterateCatastrophicItem(l, others, 'restrictive', t);
             }
         }
+    }
+
+
+    selectAlias(alias: string): _IAlias | nil {
+        let onLeft = this.restrictive.selectAlias(alias);
+        let onRight = this.joined.selectAlias(alias);
+        if (!onLeft && !onRight) {
+            return null;
+        }
+        if (!!onLeft && !!onRight) {
+            throw new QueryError(`alias "${alias}" is ambiguous`);
+        }
+        return new JoinMapAlias(this, onLeft ?? onRight!, onLeft ? '>restrictive' : '>joined');
     }
 
     *iterateCatastrophicItem(item: any, others: any[], side: 'joined' | 'restrictive', t: _Transaction) {
@@ -301,11 +381,28 @@ export class JoinSelection<TLeft = any, TRight = any> extends DataSourceBase<Joi
     }
 
     buildItem(l: TLeft, r: TRight) {
-        const ret = { '>joined': r, '>restrictive': l }
+        const ret = {
+            '>joined': r,
+            '>restrictive': l,
+            [SELECT_ALL]: () => this.merge(ret),
+        }
         setId(ret, `join${this.joinId}-${getId(l)}-${getId(r)}`);
         return ret;
     }
 
+    private merge(item: any) {
+        if (!this.mergeSelect) {
+            let sel = this.columns.map<CustomAlias>(val => ({ val }));
+            if (this.ignoreDupes) {
+                sel = sel.filter(t => !this.ignoreDupes?.has(t.val));
+            }
+            this.mergeSelect = new Selection(this, sel);
+        }
+
+        // nb: second argument is null... this is a hack : we KNOW it wont use the transaction.
+        const ret = this.mergeSelect.build(item, Symbol('hack') as any);
+        return ret;
+    }
 
     hasItem(value: JoinRaw<TLeft, TRight>): boolean {
         throw new NotSupported('lookups on joins');
@@ -344,9 +441,23 @@ export class JoinSelection<TLeft = any, TRight = any> extends DataSourceBase<Joi
                 matches: strategy.onValue.explain(e),
                 ...strategy.othersPredicate ? { filtered: true } : {},
             } : {
-                    seqScan: this.seqScanExpression.explain(e),
-                },
+                seqScan: this.seqScanExpression.explain(e),
+            },
         };
+    }
+}
+
+
+class JoinMapAlias implements _IAlias {
+
+
+    constructor(private owner: JoinSelection, private target: _IAlias, private map: string) {
+    }
+
+    *listColumns(): Iterable<IValue<any>> {
+        for (const c of this.target.listColumns()) {
+            yield c.setWrapper(this.owner, x => (x as any)[this.map]);
+        }
     }
 }
 
@@ -408,7 +519,7 @@ export class JoinIndex<T> implements _IIndex<T> {
                 yield* this.owner.iterateStrategyItem(i, strategy, op.t);
             }
         } else {
-            this.owner.schema.db.raiseGlobal('catastrophic-join-optimization');
+            this.owner.db.raiseGlobal('catastrophic-join-optimization');
             const all = [...this.other.enumerate(op.t)];
 
             for (const i of this.base.enumerate(op)) {

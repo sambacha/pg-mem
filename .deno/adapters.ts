@@ -2,6 +2,8 @@ import { LibAdapters, IMemoryDb, NotSupported, QueryResult } from './interfaces.
 import { literal } from './pg-escape.ts';
 import moment from 'https://deno.land/x/momentjs@2.29.1-deno/mod.ts';
 import lru from 'https://deno.land/x/lru_cache@6.0.0-deno.4/mod.ts';
+import { bufToString, isBuf } from './buffer-deno.ts';
+import { compareVersions, nullIsh } from './utils.ts';
 declare var __non_webpack_require__: any;
 
 const delay = (time: number | undefined) => new Promise(done => setTimeout(done, time ?? 0));
@@ -13,29 +15,41 @@ function replaceQueryArgs$(this: void, sql: string, values: any[]) {
             throw new Error('Unmatched parameter in query ' + str);
         }
         const val = values[i - 1];
-        switch (typeof val) {
-            case 'string':
-                return literal(val);
-            case 'boolean':
-                return val ? 'true' : 'false';
-            case 'number':
-                return val.toString(10);
-            default:
-                if (val === null || val === undefined) {
-                    return 'null';
-                }
-                if (val instanceof Date) {
-                    return `'${moment(val).toISOString()}'`;
-                }
-                if (typeof val === 'object') {
-                    return literal(JSON.stringify(val));
-                }
-                throw new Error('Invalid query parameter')
-        }
+        return toLiteral(val);
     });
 }
 
+function toLiteral(val: any): string {
+    switch (typeof val) {
+        case 'string':
+            return literal(val);
+        case 'boolean':
+            return val ? 'true' : 'false';
+        case 'number':
+            return val.toString(10);
+        default:
+            if (nullIsh(val)) {
+                return 'null';
+            }
+            if (Array.isArray(val)) {
+                if (val.length === 0) return `'{}'`;
+                return `ARRAY[${val.map(x => toLiteral(x)).join(', ')}]`;
+            }
+            if (val instanceof Date) {
+                return `'${moment.utc(val).toISOString()}'`;
+            }
+            if (isBuf(val)) {
+                return literal(bufToString(val));
+            }
+            if (typeof val === 'object') {
+                return literal(JSON.stringify(val));
+            }
+            throw new Error('Invalid query parameter')
+    }
+}
+
 export class Adapters implements LibAdapters {
+    private _mikroPatched?: boolean;
 
     constructor(private db: IMemoryDb) {
     }
@@ -50,54 +64,88 @@ export class Adapters implements LibAdapters {
             types?: any;
         }
         class MemPg {
+
+            connection = this;
+
             on() {
                 // nop
             }
+
             release() {
             }
+
             removeListener() {
             }
-            end(callback: any) {
-                callback();
-                return Promise.resolve();
+
+            once(what: string, handler: () => void) {
+                if (what === 'connect') {
+                    setTimeout(handler, queryLatency ?? 0);
+                }
             }
+
+            end(callback: any) {
+                if (callback) {
+                    callback();
+                    return null;
+                } else {
+                    return Promise.resolve();
+                }
+            }
+
             connect(callback: any) {
-                callback?.(null, this, () => { });
-                return Promise.resolve(this);
+                if (callback) {
+                    callback(null, this, () => { });
+                    return null;
+                } else {
+                    return Promise.resolve(this);
+                }
             }
             query(query: any, valuesOrCallback: any, callback: any) {
                 let values: any = null;
                 if (Array.isArray(valuesOrCallback)) {
                     values = valuesOrCallback;
                 }
-                callback = typeof callback === 'function'
-                    ? callback
-                    : valuesOrCallback;
+                if (callback == null && typeof valuesOrCallback === 'function') {
+                    callback = valuesOrCallback;
+                }
 
                 const pgquery = this.adaptQuery(query, values);
-
-                return new Promise((done, err) => setTimeout(() => {
-                    try {
-                        const result = this.adaptResults(query, that.db.public.query(pgquery.text));
-                        callback?.(null, result)
-                        done(result);
-                    } catch (e) {
-                        callback(e);
-                        err(e);
+                try {
+                    const result = this.adaptResults(query, that.db.public.query(pgquery.text));
+                    if (callback) {
+                        setTimeout(() => callback(null, result), queryLatency ?? 0);
+                        return null;
+                    } else {
+                        return new Promise(res => setTimeout(() => res(result), queryLatency ?? 0));
                     }
-                }, queryLatency ?? 0));
+                } catch (e) {
+                    if (callback) {
+                        setTimeout(() => callback(e), queryLatency ?? 0);
+                        return null;
+                    } else {
+                        return new Promise((_, rej) => setTimeout(() => rej(e), queryLatency ?? 0));
+                    }
+                }
             }
 
-            private adaptResults(query: PgQuery, rows: QueryResult) {
+            private adaptResults(query: PgQuery, res: QueryResult) {
                 if (query.rowMode) {
-                    throw new NotSupported('pg rowMode')
+                    throw new NotSupported('pg rowMode');
                 }
                 return {
-                    ...rows,
+                    ...res,
+                    // clone rows to avoid leaking symbols
+                    rows: res.rows.map(row => {
+                        return Object.entries(row).reduce((obj, [key, val]) => {
+                            obj[key] = val;
+                            return obj;
+                        }, {} as any);
+                    }),
                     get fields() {
-                        throw new NotSupported('get pg fields');
+                        // to implement if needed ? (never seen a lib that uses it)
+                        return [];
                     }
-                }
+                };
             }
 
             private adaptQuery(query: string | PgQuery, values: any): PgQuery {
@@ -110,7 +158,7 @@ export class Adapters implements LibAdapters {
                     // clean copy to avoid mutating things outside our scope
                     query = { ...query };
                 }
-                if (!values?.length) {
+                if (!query.values?.length) {
                     return query;
                 }
 
@@ -121,7 +169,7 @@ export class Adapters implements LibAdapters {
                 // console.log(query);
                 // console.log('\n');
 
-                query.text = replaceQueryArgs$(query.text, values);
+                query.text = replaceQueryArgs$(query.text, query.values);
                 return query;
             }
         }
@@ -159,10 +207,20 @@ export class Adapters implements LibAdapters {
 
     createPgPromise(queryLatency?: number) {
         // https://vitaly-t.github.io/pg-promise/module-pg-promise.html
-        const pgp = __non_webpack_require__('@oguimbal/pg-promise')({
-            customPg: this.createPg(queryLatency),
-        });
-        return pgp('fake connection string');
+        // https://github.com/vitaly-t/pg-promise/issues/743#issuecomment-756110347
+        const pgp = __non_webpack_require__('pg-promise')();
+        pgp.pg = this.createPg(queryLatency);
+        const db = pgp('pg-mem');
+        if (compareVersions('10.8.7', db.$config.version) < 0) {
+            throw new Error(`💀 pg-mem cannot be used with pg-promise@${db.$config.version},
+
+       👉 you must install version pg-promise@10.8.7 or newer:
+
+                npm i pg-promise@latest -S
+
+            See https://github.com/vitaly-t/pg-promise/issues/743 for details`);
+        }
+        return db;
     }
 
     createPgNative(queryLatency?: number) {
@@ -235,6 +293,58 @@ export class Adapters implements LibAdapters {
                 return ret;
             }
         }
+    }
+
+    createKnex(queryLatency?: number, knexConfig?: object): any {
+        const knex = __non_webpack_require__('knex')({
+            connection: {},
+            ...knexConfig,
+            client: 'pg',
+        });
+        knex.client.driver = this.createPg(queryLatency);
+        knex.client.version = 'pg-mem';
+        return knex;
+    }
+
+
+    async createMikroOrm(mikroOrmOptions: any, queryLatency?: number) {
+
+        const { MikroORM } = __non_webpack_require__('@mikro-orm/core');
+        const { AbstractSqlDriver, PostgreSqlConnection, PostgreSqlPlatform } = __non_webpack_require__('@mikro-orm/postgresql');
+        const that = this;
+
+        // see https://github.com/mikro-orm/mikro-orm/blob/aa71065d0727920db7da9bfdecdb33e6b8165cb5/packages/postgresql/src/PostgreSqlConnection.ts#L5
+        class PgMemConnection extends PostgreSqlConnection {
+            protected createKnexClient(type: string) {
+                return that.createKnex();
+            }
+
+        }
+        // see https://github.com/mikro-orm/mikro-orm/blob/master/packages/postgresql/src/PostgreSqlDriver.ts
+        class PgMemDriver extends AbstractSqlDriver<PgMemConnection> {
+            constructor(config: any) {
+                super(config, new PostgreSqlPlatform(), PgMemConnection, ['knex', 'pg']);
+            }
+        }
+
+        // hack: this query is not supported by pgsql-ast-parser
+        if (!this._mikroPatched) {
+            this.db.public.interceptQueries(q => {
+                if (q === `set names 'utf8';`) {
+                    return [];
+                }
+                return null;
+            });
+            this._mikroPatched = true;
+        }
+
+
+        const orm = await MikroORM.init({
+            ...mikroOrmOptions,
+            dbName: 'public',
+            driver: PgMemDriver,
+        });
+        return orm;
     }
 
 }

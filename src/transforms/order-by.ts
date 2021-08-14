@@ -1,7 +1,7 @@
 import { IValue, _ISelection, _Transaction, _Explainer, _SelectExplanation, Stats } from '../interfaces-private';
 import { FilterBase } from './transform-base';
 import { OrderByStatement } from 'pgsql-ast-parser';
-import { buildValue } from '../predicate';
+import { buildValue } from '../expression-builder';
 import { nullIsh } from '../utils';
 
 export function buildOrderBy(on: _ISelection, order: OrderByStatement[]) {
@@ -29,7 +29,7 @@ class OrderBy<T> extends FilterBase<any> {
         super(selection);
         this.order = order.map(x => ({
             by: buildValue(selection, x.by),
-            order: x.order,
+            order: x.order ?? 'ASC',
         }))
     }
 

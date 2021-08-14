@@ -1,23 +1,27 @@
 // <== THERE MUST BE NO ACTUAL IMPORTS OTHER THAN IMPORT TYPES (dependency loop)
 // ... use 'kind-of' dependency injection below
-import type { _ISelection, IValue, _IIndex, _ISchema, _IDb, _Transaction, _SelectExplanation, _Explainer, Stats, nil } from '../interfaces-private.ts';
+import type { _ISelection, IValue, _IIndex, _ISchema, _IDb, _Transaction, _SelectExplanation, _Explainer, Stats, nil, _IAlias } from '../interfaces-private.ts';
 import type { buildSelection } from './selection.ts';
 import type { buildAlias } from './alias.ts';
 import type { buildFilter } from './build-filter.ts';
 import type { buildGroupBy } from './aggregation.ts';
 import type { buildLimit } from './limit.ts';
+import type { buildUnion } from './union.ts';
 import type { buildOrderBy } from './order-by.ts';
+import type { buildDistinct } from './distinct.ts';
 
-import { Expr, SelectedColumn, SelectStatement, LimitStatement, OrderByStatement } from 'https://deno.land/x/pgsql_ast_parser@1.0.3/mod.ts';
+import { Expr, SelectedColumn, SelectStatement, LimitStatement, OrderByStatement, ExprRef } from 'https://deno.land/x/pgsql_ast_parser@7.1.0/mod.ts';
 import { RestrictiveIndex } from './restrictive-index.ts';
 
 interface Fns {
     buildSelection: typeof buildSelection;
     buildAlias: typeof buildAlias;
     buildLimit: typeof buildLimit;
+    buildUnion: typeof buildUnion;
     buildFilter: typeof buildFilter;
     buildGroupBy: typeof buildGroupBy;
     buildOrderBy: typeof buildOrderBy;
+    buildDistinct: typeof buildDistinct;
 }
 let fns: Fns;
 export function initialize(init: Fns) {
@@ -35,12 +39,40 @@ export abstract class DataSourceBase<T> implements _ISelection<T> {
     abstract isOriginOf(a: IValue<any>): boolean;
     abstract stats(t: _Transaction): Stats | null;
 
-    constructor(readonly schema: _ISchema) {
+    get db() {
+        return this.ownerSchema.db;
     }
 
-    select(select: SelectedColumn[] | nil): _ISelection<any> {
-        return fns.buildSelection(this, select);
+    constructor(readonly ownerSchema: _ISchema) {
     }
+
+    listColumns(): Iterable<IValue> {
+        return this.columns;
+    }
+
+    listSelectableIdentities(): Iterable<IValue> {
+        return this.columns;
+    }
+
+    select(select: (string | SelectedColumn)[] | nil): _ISelection<any> {
+        let sel: SelectedColumn[] | nil;
+        if (select?.some(v => typeof v === 'string')) {
+            sel = select.map<SelectedColumn>(v => typeof v !== 'string'
+                ? v
+                : {
+                    expr: { type: 'ref', name: v },
+                })
+        } else {
+            sel = select as SelectedColumn[] | nil;
+        }
+        return fns.buildSelection(this, sel);
+    }
+
+
+    selectAlias(alias: string): _IAlias | nil {
+        return this;
+    }
+
 
     filter(filter: Expr | undefined | null): _ISelection {
         if (!filter) {
@@ -66,7 +98,7 @@ export abstract class DataSourceBase<T> implements _ISelection<T> {
 
     subquery(data: _ISelection<any>, op: SelectStatement): _ISelection {
         // todo: handle refs to 'data' in op statement.
-        return this.schema.buildSelect(op);
+        return this.ownerSchema.buildSelect(op);
     }
 
     limit(limit: LimitStatement): _ISelection {
@@ -82,13 +114,22 @@ export abstract class DataSourceBase<T> implements _ISelection<T> {
         }
         return fns.buildOrderBy(this, orderBy);
     }
+
+    distinct(exprs?: Expr[]): _ISelection<any> {
+        return fns.buildDistinct(this, exprs);
+    }
+
+    union(right: _ISelection<any>): _ISelection<any> {
+        return fns.buildUnion(this, right);
+    }
+
 }
 
 export abstract class TransformBase<T> extends DataSourceBase<T> {
 
 
     constructor(protected base: _ISelection) {
-        super(base.schema);
+        super(base.ownerSchema);
     }
 
     entropy(t: _Transaction): number {
@@ -146,9 +187,9 @@ export abstract class FilterBase<T> extends TransformBase<T> {
     }
      */
 
-    getColumn(column: string): IValue;
-    getColumn(column: string, nullIfNotFound?: boolean): IValue | nil;
-    getColumn(column: string, nullIfNotFound?: boolean): IValue<any> | nil {
+    getColumn(column: string | ExprRef): IValue;
+    getColumn(column: string | ExprRef, nullIfNotFound?: boolean): IValue | nil;
+    getColumn(column: string | ExprRef, nullIfNotFound?: boolean): IValue<any> | nil {
         if (!this.base) { // istanbul ignore next
             throw new Error('Should not call .getColumn() on join');
         }

@@ -6,6 +6,9 @@
     "mochaExplorer.debuggerPort": 9239,
     "mochaExplorer.timeout": 30000,
     "mochaExplorer.require": "source-map-support/register",
+    "mochaExplorer.skipFrames": [
+        "src/tests/test-utils.ts"
+    ],
     "files.exclude": {
         "**/.git": true,
         "**/.svn": true,
@@ -27,5 +30,6 @@
         //  but it is easyier to debug
         //  ( ⚠ set it back to 'false' once you're done)
         "NOCHECKFULLQUERYUSAGE": "false",
-    }
+    },
+    "editor.formatOnSave": true
 }

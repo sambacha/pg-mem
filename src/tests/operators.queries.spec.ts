@@ -5,10 +5,9 @@ import { expect, assert } from 'chai';
 import { trimNullish } from '../utils';
 import { Types } from '../datatypes';
 import { preventSeqScan } from './test-utils';
-import { IMemoryDb } from '../interfaces';
 import { _IDb } from '../interfaces-private';
 
-describe('[Queries] Operators', () => {
+describe('Operators', () => {
 
     let db: _IDb;
     let many: (str: string) => any[];
@@ -28,12 +27,12 @@ describe('[Queries] Operators', () => {
             fields: [{
                 name: 'id',
                 type: Types.text(),
-                constraint: { type: 'primary key' },
+                constraints: [{ type: 'primary key' }],
             }, {
                 name: 'str',
                 type: Types.text(),
             }, {
-                name: 'otherStr',
+                name: 'otherstr',
                 type: Types.text(),
             }],
         });
@@ -151,15 +150,15 @@ describe('[Queries] Operators', () => {
 
         it('"IN" clause with no constant', () => {
             simpleDb();
-            none(`insert into data(id, str, otherStr) values ('A', 'A', 'B'), ('B', 'C', 'D'), ('C', 'A', 'C')`);
-            const got = many(`select * from data where id in (str, otherStr)`);
+            none(`insert into data(id, str, otherstr) values ('A', 'A', 'B'), ('B', 'C', 'D'), ('C', 'A', 'C')`);
+            const got = many(`select * from data where id in (str, otherstr)`);
             expect(got.map(x => x.id)).to.deep.equal(['A', 'C']);
         });
 
         it('"IN" clause with constant value', () => {
             simpleDb();
-            none("insert into data(id, str, otherStr) values ('A', 'A', 'B'), ('B', 'C', 'D'), ('C', 'A', 'C')");
-            const got = many(`select * from data where 'A' in (str, otherStr)`);
+            none("insert into data(id, str, otherstr) values ('A', 'A', 'B'), ('B', 'C', 'D'), ('C', 'A', 'C')");
+            const got = many(`select * from data where 'A' in (str, otherstr)`);
             expect(got.map(x => x.id)).to.deep.equal(['A', 'C']);
         });
 
@@ -183,11 +182,65 @@ describe('[Queries] Operators', () => {
 
 
 
-    it('@> on value query', () => {
-        const result = many(`create table test(id text primary key, data jsonb);
-                            insert into test values ('id1', '{"prop": "A","in":1}'), ('id2', '{"prop": "B","in":2}'), ('id4', '{"prop": "A","in":3}'), ('id5', null);
-                            select id from test where data @> '{"prop": "A"}';`);
-        expect(result.map(x => x.id)).to.deep.equal(['id1', 'id4']);
+    describe('@> operator', () => {
+
+        it('on value query', () => {
+            const result = many(`create table test(id text primary key, data jsonb);
+                                insert into test values ('id1', '{"prop": "A","in":1}'), ('id2', '{"prop": "B","in":2}'), ('id4', '{"prop": "A","in":3}'), ('id5', null);
+                                select id from test where data @> '{"prop": "A"}';`);
+            expect(result.map(x => x.id)).to.deep.equal(['id1', 'id4']);
+        });
+
+        it('on array inverted', () => {
+            expect(many(`create table test(id text, vals jsonb);
+                            insert into test values ('a', '{"x":["a", "b", "c"]}'), ('b', '{"x":["a", "d"]}');
+                            select id from test where vals @> '{"x": ["b", "a"]}';`))
+                .to.deep.equal([{ id: 'a' }]);
+        });
+
+        it('on array normal', () => {
+            expect(many(`create table test(id text, vals jsonb);
+                            insert into test values ('a', '{"x":["a", "b", "c"]}'), ('b', '{"x":["a", "d"]}');
+                            select id from test where vals @> '{"x": ["a", "b"]}';`))
+                .to.deep.equal([{ id: 'a' }]);
+        });
+
+
+        it('on array single', () => {
+            expect(many(`create table test(id text, vals jsonb);
+                            insert into test values ('a', '{"x":["a", "b", "c"]}'), ('b', '{"x":["a", "d"]}');
+                            select id from test where vals @> '{"x": ["a"]}';`))
+                .to.deep.equal([{ id: 'a' }, { id: 'b' }]);
+        })
+    });
+
+    describe('&& operator', () => {
+
+        function fill() {
+            none(`create table test(id text primary key, data text array);
+                insert into test values ('id1', '{"a", "b", "c"}'), ('id2', '{"b", "c", "d"}'), ('id4', '{"c", "d", "e"}'), ('id5', null);`)
+        }
+
+        it('finds overlap', () => {
+            fill();
+            const result = many(`select id from test where data && '{"b"}';`);
+            expect(result.map((x) => x.id)).to.deep.equal(['id1', 'id2']);
+        });
+
+
+        it('checks that any overlap is okay', () => {
+            fill();
+            const result = many(`select id from test where data && '{"b", "e"}';`);
+            expect(result.map((x) => x.id)).to.deep.equal(['id1', 'id2', 'id4']);
+        });
+
+        it('checks types', () => {
+            fill();
+            assert.throws(() => {
+                none(`select id from test where id && '{"b", "e"}'::text array;`)
+            }, /Operator does not exist: text && text\[\]/);
+        })
+
     });
 
     describe('LIKE operators', () => {
@@ -311,8 +364,8 @@ describe('[Queries] Operators', () => {
     it('executes array multiple index incomplete indexing', () => {
         expect(many(`create table test(val integer[][]);
                 insert into test values ('{{1, 2, 3}, {4, 5, 6}, {7, 8, 9}}');
-                select val[2] as x from test;`))
-            .to.deep.equal([{ x: null }])
+                select val[2] as incomplete, val[2][1] as complete from test;`))
+            .to.deep.equal([{ incomplete: null, complete: 4 }])
     });
 
     describe('Between operator', () => {

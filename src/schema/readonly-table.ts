@@ -1,9 +1,10 @@
-import { _ITable, _ISelection, _ISchema, _Transaction, _IIndex, IValue, NotSupported, ReadOnlyError, _Column, SchemaField, IndexDef, _Explainer, _SelectExplanation, _IType, ChangeHandler, Stats } from '../interfaces-private';
-import { CreateColumnDef, ConstraintDef } from 'pgsql-ast-parser';
+import { _ITable, _ISelection, _ISchema, _Transaction, _IIndex, IValue, NotSupported, PermissionDeniedError, _Column, SchemaField, IndexDef, _Explainer, _SelectExplanation, _IType, ChangeHandler, Stats, DropHandler, IndexHandler, RegClass, RegType, Reg } from '../interfaces-private';
+import { CreateColumnDef, ExprRef, TableConstraint } from 'pgsql-ast-parser';
 import { DataSourceBase } from '../transforms/transform-base';
-import { Schema, ColumnNotFound, nil } from '../interfaces';
+import { Schema, ColumnNotFound, nil, ISubscription } from '../interfaces';
 import { buildAlias } from '../transforms/alias';
 import { columnEvaluator } from '../transforms/selection';
+import { colByName, findTemplate } from '../utils';
 
 export abstract class ReadOnlyTable<T = any> extends DataSourceBase<T> implements _ITable, _ISelection<any> {
 
@@ -13,23 +14,35 @@ export abstract class ReadOnlyTable<T = any> extends DataSourceBase<T> implement
     abstract hasItem(value: T, t: _Transaction): boolean;
     abstract readonly _schema: Schema;
 
+    reg!: Reg;
+
     readonly selection: _ISelection = buildAlias(this);
-    hidden = true;
+    readonly hidden = true;
 
     isOriginOf(v: IValue): boolean {
         return v.origin === this || v.origin === this.selection;
     }
 
-    constructor(schema: _ISchema) {
+
+    get type() {
+        return 'table' as const;
+    }
+
+    constructor(private schema: _ISchema) {
         super(schema);
+    }
+
+    get name(): string {
+        return this._schema.name;
+    }
+
+    register() {
+        this.reg = this.schema._reg_register(this);
     }
 
     private columnsById = new Map<string, IValue>();
     private _columns?: IValue[];
 
-    get name(): string {
-        return this._schema.name;
-    }
 
     private build() {
         if (this._columns) {
@@ -39,7 +52,7 @@ export abstract class ReadOnlyTable<T = any> extends DataSourceBase<T> implement
         for (const _col of this._schema.fields) {
             const newCol = columnEvaluator(this, _col.name, _col.type as _IType);
             this._columns.push(newCol);
-            this.columnsById.set(_col.name.toLowerCase(), newCol);
+            this.columnsById.set(_col.name, newCol);
         }
     }
 
@@ -48,19 +61,15 @@ export abstract class ReadOnlyTable<T = any> extends DataSourceBase<T> implement
         return this._columns!;
     }
 
-    getColumn(column: string): IValue;
-    getColumn(column: string, nullIfNotFound?: boolean): IValue | nil;
-    getColumn(column: string, nullIfNotFound?: boolean): IValue<any> | nil {
+    getColumn(column: string | ExprRef): IValue;
+    getColumn(column: string | ExprRef, nullIfNotFound?: boolean): IValue | nil;
+    getColumn(column: string | ExprRef, nullIfNotFound?: boolean): IValue<any> | nil {
         this.build();
-        const got = this.columnsById.get(column.toLowerCase());
-        if (!got && !nullIfNotFound) {
-            throw new ColumnNotFound(column);
-        }
-        return got;
+        return colByName(this.columnsById, column, nullIfNotFound);
     }
 
     explain(e: _Explainer): _SelectExplanation {
-        throw new ReadOnlyError('information schema');
+        throw new PermissionDeniedError(this.name);
     }
 
     listIndices(): IndexDef[] {
@@ -71,33 +80,45 @@ export abstract class ReadOnlyTable<T = any> extends DataSourceBase<T> implement
         throw new NotSupported('stats (count, ...) on information schema');
     }
 
-    get columnDefs(): _Column[] {
-        throw new ReadOnlyError('information schema');
-    }
-
     rename(to: string): this {
-        throw new ReadOnlyError('information schema');
+        throw new PermissionDeniedError(this.name);
     }
     update(t: _Transaction, toUpdate: any) {
-        throw new ReadOnlyError('information schema');
+        throw new PermissionDeniedError(this.name);
     }
     addColumn(column: SchemaField | CreateColumnDef): _Column {
-        throw new ReadOnlyError('information schema');
+        throw new PermissionDeniedError(this.name);
     }
     getColumnRef(column: string, nullIfNotFound?: boolean): _Column {
-        throw new ReadOnlyError('information schema');
+        throw new PermissionDeniedError(this.name);
     }
-    addConstraint(constraint: ConstraintDef, t: _Transaction) {
-        throw new ReadOnlyError('information schema');
+    addConstraint(constraint: TableConstraint, t: _Transaction) {
+        throw new PermissionDeniedError(this.name);
     }
-    insert(toInsert: any): void {
-        throw new ReadOnlyError('information schema');
+    insert(item: any) {
+        throw new PermissionDeniedError(this.name);
+    }
+    doInsert(toInsert: any): void {
+        throw new PermissionDeniedError(this.name);
     }
     delete(t: _Transaction, toDelete: T): void {
-        throw new ReadOnlyError('information schema');
+        throw new PermissionDeniedError(this.name);
     }
+    truncate(t: _Transaction): void {
+        throw new PermissionDeniedError(this.name);
+    }
+
     createIndex(): this {
-        throw new ReadOnlyError('information schema');
+        throw new PermissionDeniedError(this.name);
+    }
+    dropIndex(t: _Transaction, name: string): void {
+        throw new PermissionDeniedError(this.name);
+    }
+    setHidden(): this {
+        throw new PermissionDeniedError(this.name);
+    }
+    drop(t: _Transaction): void {
+        throw new PermissionDeniedError(this.name);
     }
 
     setReadonly(): this {
@@ -111,9 +132,51 @@ export abstract class ReadOnlyTable<T = any> extends DataSourceBase<T> implement
     on(): any {
         throw new NotSupported('subscribing information schema');
     }
-
-    onChange(columns: string[], check: ChangeHandler<T>) {
+    onBeforeChange(columns: string[], check: ChangeHandler<T>) {
         // nop
+        return { unsubscribe() { } }
+    }
+    onCheckChange(columns: string[], check: ChangeHandler<T>) {
+        // nop
+        return { unsubscribe() { } }
+    }
+    onTruncate(sub: DropHandler): ISubscription {
+        // nop
+        return { unsubscribe() { } }
+    }
+    onDrop(sub: DropHandler): ISubscription {
+        // nop
+        return { unsubscribe() { } }
+    }
+    onIndex(sub: IndexHandler): ISubscription {
+        // nop
+        return { unsubscribe() { } }
     }
 
+
+    find(template?: T, columns?: (keyof T)[]): Iterable<T> {
+        return findTemplate(this.selection, this.db.data, template, columns);
+    }
+
+
+    make(table: _ITable, i: number, t: IValue<any>): any {
+        throw new Error('not implemented');
+    }
+
+
+    *itemsByTable(table: string | _ITable, t: _Transaction): IterableIterator<any> {
+        if (typeof table === 'string') {
+            for (const s of this.db.listSchemas()) {
+                const got = s.getTable(table, true);
+                if (got) {
+                    yield* this.itemsByTable(got, t);
+                }
+            }
+        } else {
+            let i = 0;
+            for (const f of table.selection.columns) {
+                yield this.make(table, ++i, f);
+            }
+        }
+    }
 }

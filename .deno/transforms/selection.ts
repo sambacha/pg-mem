@@ -1,17 +1,19 @@
-import { _ISelection, _IIndex, IValue, setId, getId, _IType, _Transaction, _Column, _ITable, _Explainer, _SelectExplanation, IndexKey, _IndexExplanation, IndexExpression, IndexOp, Stats } from '../interfaces-private.ts';
-import { QueryError, ColumnNotFound, DataType, CastError, Schema, NotSupported, AmbiguousColumn, SchemaField, nil } from '../interfaces.ts';
-import { buildValue } from '../predicate.ts';
-import { Evaluator } from '../valuetypes.ts';
+import { _ISelection, _IIndex, IValue, setId, getId, _IType, _Transaction, _Column, _ITable, _Explainer, _SelectExplanation, IndexKey, _IndexExplanation, IndexExpression, IndexOp, Stats, _IAlias } from '../interfaces-private.ts';
+import { QueryError, ColumnNotFound, DataType, CastError, Schema, NotSupported, AmbiguousColumn, SchemaField, nil, typeDefToStr } from '../interfaces.ts';
+import { buildValue } from '../expression-builder.ts';
+import { Evaluator } from '../evaluator.ts';
 import { TransformBase } from './transform-base.ts';
-import { SelectedColumn, CreateColumnDef, ExprCall, Expr } from 'https://deno.land/x/pgsql_ast_parser@1.0.3/mod.ts';
+import { SelectedColumn, CreateColumnDef, ExprCall, Expr, astVisitor, ExprRef } from 'https://deno.land/x/pgsql_ast_parser@7.1.0/mod.ts';
 import { aggregationFunctions, buildGroupBy } from './aggregation.ts';
-import { AstVisitor } from '../ast-visitor.ts';
-import { isSelectAllArgList } from '../utils.ts';
+
+import { asSingleQName, colByName, colToStr, isSelectAllArgList, suggestColumnName } from '../utils.ts';
+
 
 export function buildSelection(on: _ISelection, select: SelectedColumn[] | nil) {
+    select = select ?? [];
 
     // if this is a "SELECT *" => just ignore
-    if (!select || isSelectAllArgList(select.map(x => x.expr))) {
+    if (isSelectAllArgList(select.map(x => x.expr))) {
         if (!on.columns.length) {
             throw new QueryError('SELECT * with no tables specified is not valid');
         }
@@ -20,8 +22,8 @@ export function buildSelection(on: _ISelection, select: SelectedColumn[] | nil) 
 
     // if there is any aggregation function
     // check if there is any aggregation
-    for (const col of select) {
-        if (new HasAggregVisitor().check(col.expr)) {
+    for (const col of select ?? []) {
+        if ('expr' in col && hasAggreg(col.expr)) {
             // yea, there is an aggregation somewhere in selection
             return buildGroupBy(on, [], select);
         }
@@ -30,27 +32,32 @@ export function buildSelection(on: _ISelection, select: SelectedColumn[] | nil) 
     return new Selection(on, select);
 }
 
-class HasAggregVisitor extends AstVisitor {
-    private aggreg?: boolean;
-    check(e: Expr) {
-        this.visit(e);
-        return this.aggreg;
-    }
-    visitCall(expr: ExprCall) {
-        if (aggregationFunctions.has(expr.function)) {
-            // yea, this is an aggregation
-            this.aggreg = true;
+
+function hasAggreg(e: Expr) {
+    let has = false;
+    astVisitor(visitor => ({
+        call: expr => {
+            const nm = asSingleQName(expr.function, 'pg_catalog');
+            if (nm && aggregationFunctions.has(nm)) {
+                // yea, this is an aggregation
+                has = true;
+                return;
+            }
+            visitor.super().call(expr);
         }
-    }
+    })).expr(e);
+    return has
 }
+
+
 
 export function columnEvaluator(this: void, on: _ISelection, id: string, type: _IType) {
     if (!id) {
         throw new Error('Invalid column id');
     }
     const ret = new Evaluator(
-        type
-        , id
+        on.ownerSchema
+        , type
         , id
         , id
         , null
@@ -61,65 +68,105 @@ export function columnEvaluator(this: void, on: _ISelection, id: string, type: _
     return ret;
 }
 
+function* buildCols(this: void, base: _ISelection, columns: (SelectedColumn | CustomAlias)[]): Iterable<CustomAlias> {
+    for (const s of columns) {
+        if ('val' in s) {
+            if (s.val.origin !== base) {
+                throw new Error('Corrupted selection');
+            }
+            yield s;
+            continue;
+        }
+        if (s.expr.type === 'ref' && s.expr.name === '*') {
+            // handle select "*"
+            if (s.alias) {
+                throw new QueryError('Cannot alias *');
+            }
+            let of: _IAlias = base;
+            const alias = s.expr.table;
+            if (alias) {
+                // handle select "x.*"
+                const sub = base.selectAlias(alias.name);
+                if (!sub) {
+                    throw new QueryError(`Unknown alias "${alias.name}"`);
+                }
+                of = sub;
+            }
 
-export class Selection<T> extends TransformBase<T> implements _ISelection<T> {
+            for (const val of of.listColumns()) {
+                yield { val };
+            }
+
+        } else {
+            const val = buildValue(base as _ISelection, s.expr);
+            yield { val, as: s.alias?.name, expr: s.expr };
+        }
+    }
+}
+
+export interface CustomAlias {
+    val: IValue;
+    as?: string;
+    expr?: Expr
+}
+
+export class Selection<T = any> extends TransformBase<T> implements _ISelection<T> {
 
     private columnIds: string[] = [];
     private columnsOrigin: IValue[] = [];
     private columnMapping = new Map<IValue, IValue>();
     private indexCache = new Map<IValue, _IIndex>();
-    private columnsById: { [key: string]: IValue[] } = {};
+    private columnsById = new Map<string, IValue[]>();
     private symbol = Symbol();
 
     readonly columns: IValue[] = [];
 
 
-    constructor(base: _ISelection<any>, columns: SelectedColumn[]) {
+    constructor(base: _ISelection<any>, _columns: (SelectedColumn | CustomAlias)[]) {
         super(base);
 
-        if (!columns.length) {
-            throw new QueryError('Invalid selection');
-        }
-
         // build non-conflicting column ids based on existing ones
-        this.columnIds = [];
-        for (const s of columns) {
-            if (s.expr.type === 'ref') {
-                if (s.expr.name === '*') {
-                    if (s.alias) {
-                        throw new QueryError('Cannot alias *');
-                    }
-                    for (const _col of base.columns) {
-                        this.columnIds.push(_col.id!);
-                    }
-                } else {
-                    this.columnIds.push(s.alias ?? s.expr.name);
-                }
-            } else {
-                this.columnIds.push(s.alias!);
-            }
-        }
+        const columns = [...buildCols(base, _columns)];
+        this.columnIds = columns.map(x => x.as ?? x.val.id!);
 
         // build column ids
-        let anonymous = 0;
+        let anonymousBases = new Map<string, number>();
         for (let i = 0; i < this.columnIds.length; i++) {
             if (!this.columnIds[i]) {
-                this.columnIds[i] = 'column' + (anonymous++);
+                let id = suggestColumnName(columns[i].expr) ?? 'column';
+
+                // check no collision with an existing column
+                let cnt = anonymousBases.get(id);
+                this.columnIds[i] = id + (cnt ? cnt : '');
+                anonymousBases.set(id, (cnt ?? 0) + 1);
             }
         }
-        // this.columnIds = buildColumnIds(this.columnIds);
+
 
         // build columns to select
         for (let i = 0; i < columns.length; i++) {
-            const s = columns[i];
-            if (s.expr.type === 'ref' && s.expr.name === '*') {
-                for (const _col of base.columns) {
-                    this.refColumn(_col, this.columnIds[i]);
-                }
-            } else {
-                let _col = buildValue(base as _ISelection, s.expr);
-                this.refColumn(_col, this.columnIds[i]);
+            this.refColumn(columns[i].val, this.columnIds[i]);
+        }
+
+
+        // ONLY ONCE COLUMNS HAVE BEEN REFERENCED BY ID,
+        // rename ids for columns which have the same id
+        // this allows yielding ambiguous columns data
+        const has = new Map<string, number>();
+        for (let i = 0; i < columns.length; i++) {
+            const orig = this.columnIds[i];
+            const oi = has.get(orig);
+            if (typeof oi !== 'number') {
+                has.set(orig, i);
+                continue;
             }
+            let ret: string = orig;
+            let k = 0;
+            do {
+                ret = orig + (++k);
+            } while (this.columnIds.includes(ret));
+            this.columnIds[i] = ret;
+            has.set(ret, i);
         }
     }
 
@@ -131,10 +178,9 @@ export class Selection<T> extends TransformBase<T> implements _ISelection<T> {
         if (!col.id) {
             return;
         }
-        const low = col.id.toLowerCase();
-        let ci = this.columnsById[low];
+        let ci = this.columnsById.get(col.id);
         if (!ci) {
-            this.columnsById[low] = ci = [];
+            this.columnsById.set(col.id, ci = []);
         }
         ci.push(col);
     }
@@ -166,18 +212,18 @@ export class Selection<T> extends TransformBase<T> implements _ISelection<T> {
         return (value as any)[this.symbol] === this.symbol;
     }
 
-    getColumn(column: string): IValue;
-    getColumn(column: string, nullIfNotFound?: boolean): IValue | nil;
-    getColumn(column: string, nullIfNotFound?: boolean): IValue | nil {
-        const ret = this.columnsById[column.toLowerCase()];
+    getColumn(column: string | ExprRef): IValue;
+    getColumn(column: string | ExprRef, nullIfNotFound?: boolean): IValue | nil;
+    getColumn(column: string | ExprRef, nullIfNotFound?: boolean): IValue | nil {
+        const ret = colByName(this.columnsById, column, true);
         if (!ret?.length) {
             if (nullIfNotFound) {
                 return null;
             }
-            throw new ColumnNotFound(column);
+            throw new ColumnNotFound(colToStr(column));
         }
         if (ret.length !== 1) {
-            throw new AmbiguousColumn(column);
+            throw new AmbiguousColumn(colToStr(column));
         }
         return ret[0];
     }

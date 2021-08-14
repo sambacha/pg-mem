@@ -2,11 +2,10 @@ import 'mocha';
 import 'chai';
 import { newDb } from '../db';
 import { expect, assert } from 'chai';
-import { watchUse } from '../utils';
-import { preventSeqScan } from './test-utils';
 import { IMemoryDb } from '../interfaces-private';
+import { expectSingle } from './test-utils';
 
-describe('[Queries] Conversions', () => {
+describe('Conversions', () => {
 
     let db: IMemoryDb;
     let many: (str: string) => any[];
@@ -130,5 +129,33 @@ describe('[Queries] Conversions', () => {
             assert.throw(() => many(`select to_date('20170103','YYYYMMDD') > ('2017-' || '01-03') as x;`));
         })
 
+    })
+
+
+    it('parses an interval literal', () => {
+        expect(many(`SELECT INTERVAL 'P2M' as v`))
+            .to.deep.equal([{ v: { months: 2 } }]);
+    });
+
+    describe('Time', () => {
+        expectSingle(`select time '23:18'`, '23:18:00');
+        expectSingle(`select time '23:18.5'`, '00:23:18.5');
+        expectSingle(`select time '23:18.005'`, '00:23:18.005');
+        expectSingle(`select time '1:2:3'`, '01:02:03');
+    })
+
+    it('can cast integer to text', () => {
+        expect(many(`SELECT 42::text`))
+            .to.deep.equal([{ text: '42' }]);
+    })
+
+    it('can cast float to text', () => {
+        expect(many(`SELECT 42.3::text`))
+            .to.deep.equal([{ text: '42.3' }]);
+    })
+
+    it('can cast empty array', () => {
+        expect(many(`select array[]::text[] val`))
+            .to.deep.equal([{ val: [] }]);
     })
 });

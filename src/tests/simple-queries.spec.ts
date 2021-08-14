@@ -4,10 +4,10 @@ import { newDb } from '../db';
 import { expect, assert } from 'chai';
 import { trimNullish } from '../utils';
 import { Types } from '../datatypes';
-import { preventSeqScan } from './test-utils';
+import { expectSingle, preventSeqScan } from './test-utils';
 import { IMemoryDb } from '../interfaces';
 
-describe('[Queries] Simple queries', () => {
+describe('Simple queries', () => {
 
     let db: IMemoryDb;
     let many: (str: string) => any[];
@@ -27,18 +27,22 @@ describe('[Queries] Simple queries', () => {
             fields: [{
                 name: 'id',
                 type: Types.text(),
-                constraint: { type: 'primary key' },
+                constraints: [{ type: 'primary key' }],
             }, {
                 name: 'str',
                 type: Types.text(),
             }, {
-                name: 'otherStr',
+                name: 'otherstr',
                 type: Types.text(),
             }],
         });
         return db;
     }
 
+    it('handles show', () => {
+        expect(many(`show server_version`))
+            .to.deep.equal([{ server_version: '12.2 (pg-mem)' }]);
+    })
 
     it('can insert and select null', () => {
         simpleDb();
@@ -49,7 +53,36 @@ describe('[Queries] Simple queries', () => {
         expect(got).to.deep.equal([]);
     });
 
+    it('supports "set" statement', () => {
+        none(`set session_replication_role = 'replica';`);
+    })
 
+
+    it('can select twice the same colmun', () => {
+        simpleDb();
+        expect(many(`insert into data(id) values ('key');
+            select id, id from data`))
+            .to.deep.equal([{
+                id: 'key',
+                id1: 'key',
+            }]);
+    });
+
+
+    it('supports inner request (bugfix)', () => {
+        // this used to throw:
+        many(`
+        create table duplicate_hash(dispute_id text, hash text, primary key(dispute_id, hash));
+                select
+                count(dispute_id) cnt
+            from duplicate_hash dh
+            where dh.hash in (select
+                        dhi.hash
+                        from duplicate_hash dhi
+                        where dhi.dispute_id = 'CFR-210419-DMMM')
+                and dh.dispute_id!='CFR-210419-DMMM';
+        `);
+    })
 
     it('can select NOT', () => {
         expect(many(`select not true as v`))
@@ -81,13 +114,13 @@ describe('[Queries] Simple queries', () => {
 
     it('does not equate null values on seq scan', () => {
         simpleDb();
-        none(`insert into data(id, str, otherStr) values ('id1', null, null)`);
-        none(`insert into data(id, str, otherStr) values ('id2', 'A', 'A')`);
-        none(`insert into data(id, str, otherStr) values ('id3', 'A', 'B')`);
-        none(`insert into data(id, str, otherStr) values ('id4', null, 'B')`);
-        none(`insert into data(id, str, otherStr) values ('id5', 'A', null)`);
-        const got = many('select * from data where str = otherStr');
-        expect(got).to.deep.equal([{ id: 'id2', str: 'A', otherStr: 'A' }]);
+        none(`insert into data(id, str, otherstr) values ('id1', null, null)`);
+        none(`insert into data(id, str, otherstr) values ('id2', 'A', 'A')`);
+        none(`insert into data(id, str, otherstr) values ('id3', 'A', 'B')`);
+        none(`insert into data(id, str, otherstr) values ('id4', null, 'B')`);
+        none(`insert into data(id, str, otherstr) values ('id5', 'A', null)`);
+        const got = many('select * from data where str = otherstr');
+        expect(got).to.deep.equal([{ id: 'id2', str: 'A', otherstr: 'A' }]);
     });
 
 
@@ -115,18 +148,58 @@ describe('[Queries] Simple queries', () => {
 
 
 
+    it('OR bugfix when there is a null column', () => {
+        expect(many(`CREATE TABLE IF NOT EXISTS test(
+                id varchar(100) not null,
+                val text
+            );
+
+            INSERT INTO test(id, val) VALUES ('a', null), ('b', 'row b');
+
+            SELECT *  FROM test
+                    WHERE id in ('a', 'b') OR val = 'SOMETHING_IRRELEVANT';`))
+            .to.deep.equal([{ id: 'a', val: null }, { id: 'b', val: 'row b' }]);
+    });
+
+
     it('insert returning', () => {
         expect(many(`create table test(id serial primary key, val text, nl text);
                                 insert into test(val) values ('a'), ('b') returning id, val;`))
             .to.deep.equal([{ id: 1, val: 'a' }, { id: 2, val: 'b' }]);
     });
 
+    it('supports bigserial data type', () => {
+        expect(many(`create table test(id bigserial primary key, val text, nl text);
+                                insert into test(val) values ('a'), ('b') returning id, val;`))
+            .to.deep.equal([{ id: 1, val: 'a' }, { id: 2, val: 'b' }]);
+    });
+
+    it('can create two tables with different casing', () => {
+        none(`create table example(id text);
+            create table "Example"(val text);
+            insert into example values ('one');
+            insert into Example values ('two');
+            insert into "Example" values ('three');`);
+
+        expect(many('select * from example'))
+            .to.deep.equal([{ id: 'one' }, { id: 'two' }]);
+        expect(many('select * from Example'))
+            .to.deep.equal([{ id: 'one' }, { id: 'two' }]);
+        expect(many('select * from "Example"'))
+            .to.deep.equal([{ val: 'three' }]);
+    })
+
 
     it('call lower in select', () => {
         simpleDb();
         none(`insert into data(id) values ('SOME STRING')`);
         const result = many(`select lower(id) from data`);
-        expect(result).to.deep.equal([{ column0: 'some string' }]);
+        expect(result).to.deep.equal([{ lower: 'some string' }]);
+    });
+
+    it('cannot select from table with function syntax', () => {
+        simpleDb();
+        assert.throws(() => many(`select * from data()`));
     });
 
     it('aliases are case insensitive', () => {
@@ -134,10 +207,43 @@ describe('[Queries] Simple queries', () => {
         none(`select xx.ID from data as XX`);
     });
 
-    it('can select current_schema', () => {
+    it('now() does not behave as dual table', () => {
+        assert.throws(() => many(`select * from now`), /relation "now" does not exist/);
+    })
+
+    it('can select * from now()', () => {
+        const ret = many(`select * from now()`);
+        expect(ret.length).to.equal(1);
+        expect(ret[0].now).to.be.instanceOf(Date);
+    });
+
+    it('can select now()', () => {
+        expect(many(`select now()`)[0])
+            .to.have.property('now');
+    })
+
+    it('can select current_schema as classic table', () => {
         simpleDb();
         expect(many('select * from current_schema')).to.deep.equal([{ current_schema: 'public' }]);
     });
+
+
+    it('can select current_schema as table function', () => {
+        simpleDb();
+        expect(many('select * from current_schema()')).to.deep.equal([{ current_schema: 'public' }]);
+    });
+
+
+    it('can select current_schema as function', () => {
+        simpleDb();
+        expect(many('select current_schema()')).to.deep.equal([{ current_schema: 'public' }]);
+    });
+
+    it('can select current_schema as const', () => {
+        simpleDb();
+        expect(many('select current_schema')).to.deep.equal([{ current_schema: 'public' }]);
+    });
+
 
 
     it('can select info tables', () => {
@@ -151,7 +257,7 @@ describe('[Queries] Simple queries', () => {
         expect(many(`select column_name from information_schema.columns where table_name='data'`))
             .to.deep.equal([{ column_name: 'id' }
                 , { column_name: 'str' }
-                , { column_name: 'otherStr' }]);
+                , { column_name: 'otherstr' }]);
     });
 
 
@@ -258,5 +364,118 @@ describe('[Queries] Simple queries', () => {
         none(`create table test(ka text, kb integer, val text,  primary key (ka, kb));
             insert into test values ('a', 1, 'oldA');`);
         assert.throws(() => none(`insert into test values ('a', 1, 'oldA');`));
+    });
+
+
+    describe('substring query as range', () => {
+
+        for (const [k, v] of [
+            [`select substring('012345678' from 2 for 3) as v`, '123'],
+            [`select substring('012345678' from 5) as v`, '45678'],
+            [`select substring('012345678' for 3) as v`, '012'],
+            [`select substring('012345678' from 1) as v`, '012345678'],
+            [`select substring('012345678' from 0) as v`, '012345678'],
+            [`select substring('012345678' from -1) as v`, '012345678'],
+        ]) {
+            it(k, () => {
+                expect(many(k))
+                    .to.deep.equal([{ v }]);
+            })
+        }
+        it('fails with negative for', () => {
+            assert.throws(() => many(`select substring('012345678' for -1) as v`), /negative substring length not allowed/);
+        })
+    })
+
+    it('supports substring() as classic function range', () => {
+        expect(many(`select substring('012345678', 2, 3) as v`))
+            .to.deep.equal([{ v: '123' }]);
+        expect(many(`select substring('012345678', 5) as v`))
+            .to.deep.equal([{ v: '45678' }]);
+    })
+
+    describe('overlay query as range', () => {
+
+        for (const [k, v] of [
+            [`select overlay('12345678' placing 'ab' from 3) as v`, '12ab5678'],
+            [`select overlay('12345678' placing 'abc' from 4) as v`, '123abc78'],
+
+            [`select overlay('12345678' placing 'ab' from 3 for 0) as v`, '12ab345678'],
+            [`select overlay('12345678' placing 'abc' from 3 for 0) as v`, '12abc345678'],
+            [`select overlay('12345678' placing 'abc' from 3 for 1) as v`, '12abc45678'],
+            [`select overlay('12345678' placing 'ab' from 3 for 4) as v`, '12ab78'],
+            [`select overlay('12345678' placing 'ab' from 2 for 4) as v`, '1ab678'],
+            [`select overlay('12345678' placing 'ab' from 2 for 5) as v`, '1ab78'],
+            [`select overlay('12345678' placing 'ab' from 1 for 5) as v`, 'ab678'],
+            [`select overlay('12345678' placing 'ab' from 2) as v`, '1ab45678'],
+            [`select overlay('12345678' placing 'ab' from 2 for 1) as v`, '1ab345678'],
+            [`select overlay('12345678' placing 'ab' from 2 for 0) as v`, '1ab2345678'],
+            [`select overlay('12345678' placing 'ab' from 2 for -3) as v`, '1ab12345678'],
+        ]) {
+            it(k, () => {
+                expect(many(k))
+                    .to.deep.equal([{ v }]);
+            })
+        }
+        it('fails with negative from', () => {
+            assert.throws(() => many(`select overlay('12345678' placing 'ab' from -2) as v`), /negative substring length not allowed/);
+            assert.throws(() => many(`select overlay('12345678' placing 'ab' from 0) as v`), /negative substring length not allowed/);
+        })
+    })
+
+
+    it('should be able to create schema', () => {
+        expect(many(`create schema other;
+                create table other.tother(id text);
+                insert into other.tother values ('x');
+                select * from other.tother`))
+            .to.deep.equal([{ id: 'x' }]);
+    });
+
+
+    it('can select list', () => {
+        expect(many(`select (1, 2) as v`))
+            .to.deep.equal([{ v: [1, 2] }]);
+    })
+
+
+    it('can convert list to text', () => {
+        expect(many(`select (1, 2)::text as v`))
+            .to.deep.equal([{ v: '(1,2)' }]);
+    })
+
+    it('supports select ARRAY[]', () => {
+        expect(many(`select ARRAY[1, 2] as v`))
+            .to.deep.equal([{ v: [1, 2] }])
+    });
+
+    it('can convert array to text', () => {
+        expect(many(`select ARRAY[1, 2]::text as v`))
+            .to.deep.equal([{ v: '{1,2}' }]);
+    })
+
+    it('can execute ANY on ARRAY[]', () => {
+        expect(many(`create table tbl (id text);
+                    insert into tbl values ('A'), ('B'), ('C');
+                    SELECT * FROM tbl WHERE id = ANY(array['A', 'C'])`))
+            .to.deep.equal([{ id: 'A' }, { id: 'C' }]);
+    });
+
+
+    it('cannot evaluate casted empty arrays', () => {
+        none(`CREATE TABLE example (
+            members               VARCHAR[]
+        );
+        select array[]::varchar[];
+        INSERT INTO example (members) VALUES (ARRAY[]::varchar[]);
+        INSERT INTO example (members) VALUES ('{}');`)
+    });
+
+    it('should not be able to determine the type of an empty array', () => {
+        assert.throw(() => none(`SELECT array[];`), /cannot determine type of empty array/);
+        none(`CREATE TABLE example (
+            members               VARCHAR[]
+        );`);
+        assert.throws(() => none(`INSERT INTO example (members) VALUES (ARRAY[])`), /cannot determine type of empty array/);
     })
 });

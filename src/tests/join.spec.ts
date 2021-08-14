@@ -5,7 +5,7 @@ import { expect, assert } from 'chai';
 import { preventSeqScan, preventCataJoin, watchCataJoins } from './test-utils';
 import { _IDb } from '../interfaces-private';
 
-describe('[Queries] Joins', () => {
+describe('Joins', () => {
 
     let db: _IDb;
     let many: (str: string) => any[];
@@ -82,7 +82,7 @@ describe('[Queries] Joins', () => {
             joined: { _: 'table', table: 'tb' },
             on: {
                 seqScan: {
-                    col: 'bid = bid',
+                    col: '<complex expression>',
                     on: 2,// <== directly on join
                 } as any,
             }
@@ -91,6 +91,25 @@ describe('[Queries] Joins', () => {
         expect(result).to.deep.equal([
             { val: 'val1', aid: 'aid1', abid: 'bid1', bbid: 'bid1' },
             { val: 'val2', aid: 'aid2', abid: 'bid2', bbid: 'bid2' },
+        ]);
+    });
+
+
+
+    it('can select * on join', () => {
+        const result = many(`create table ta(aid text, bid text);
+                            create table tb(bid text, val text);
+                            insert into ta values ('aid1', 'bid1');
+                            insert into ta values ('aid2', 'bid2');
+
+                            insert into tb values ('bid1', 'val1');
+                            insert into tb values ('bid2', 'val2');
+
+                            select * from ta join tb on ta.bid = tb.bid`);
+
+        expect(result).to.deep.equal([
+            { val: 'val1', aid: 'aid1', bid: 'bid1', bid1: 'bid1' },
+            { val: 'val2', aid: 'aid2', bid: 'bid2', bid1: 'bid2' },
         ]);
     });
 
@@ -601,7 +620,7 @@ describe('[Queries] Joins', () => {
             ]);
     });
 
-    it('can left join', () => {
+    it('can left join using "ON"', () => {
         photos();
         preventSeqScan(db, 'photo');
         const result = many(`SELECT "user"."id" AS "user_id", "user"."name" AS "user_name", "photo"."id" AS "photo_id", "photo"."url" AS "photo_url", "photo"."userId" AS "photo_userId"
@@ -616,6 +635,87 @@ describe('[Queries] Joins', () => {
                 { user_id: 'u3', user_name: 'no camera', photo_id: null, photo_url: null, photo_userId: null },
             ]);
     });
+
+    function childrenToys() {
+        none(`create table child(id int, name text);
+                create table toy(child_id int, name text);
+                insert into child values (1, 'Tom');
+                insert into toy values (1, 'Gun');`)
+    }
+
+    describe('selects first mentioned table column on * ambiguity', () => {
+        beforeEach(() => childrenToys());
+
+        it('with no index', () => {
+            check();
+        })
+
+        it('with index on first', () => {
+            none(`create  index on child(id)`);
+            check();
+        })
+
+
+        it('with index on second', () => {
+            none(`create  index on toy(child_id)`);
+            check();
+        })
+
+        function check() {
+            expect(many(`select * from child
+        join toy on id=child_id`))
+                .to.deep.equal([{
+                    id: 1,
+                    child_id: 1,
+                    name: 'Tom',
+                    name1: 'Gun',
+                }]);
+        }
+    });
+
+
+    it('throws on selection ambiguity', () => {
+        childrenToys();
+        assert.throws(() => none(`select name from child
+        join toy on id=child_id`), /column reference "name" is ambiguous/);
+    });
+
+
+
+    it('does not throw when ambiguity not selected', () => {
+        childrenToys();
+        none(`select id, child_id from child
+        join toy on id=child_id`);
+    });
+
+
+
+    describe('join "USING"', () => {
+        beforeEach(() => none(`create table names(id int, name text);
+                                create table rates(id int, rate int);
+                                insert into names values (1, 'Me');
+                                insert into rates values (1, 10);`))
+
+        it('can left join', () => {
+            expect(many(`select * from rates left join names using (id)`))
+                .to.deep.equal([{
+                    id: 1, // ==> IDENTIFIED AS UNIQUE !
+                    name: 'Me',
+                    rate: 10,
+                }]);
+        });
+
+        it('it outputs two ID columns when not using "USING"', () => {
+            expect(many(`select * from rates left join names ON rates.id = names.id`))
+                .to.deep.equal([{
+                    id: 1,
+                    id1: 1,
+                    name: 'Me',
+                    rate: 10,
+                }]);
+        });
+    })
+
 
 
     it('can right join', () => {
@@ -635,61 +735,99 @@ describe('[Queries] Joins', () => {
             ]);
     });
 
-    it ('can self right join', () => {
-        const got = many(`create table test(usr text, friend text);
-        insert into test values ('me', 'you');
-        insert into test values ('me', 'other1');
-        insert into test values ('you', 'me');
-        insert into test values ('you', 'other2');
-        select a.usr, b.friend from
-            test a
-            right join test b on a.friend = b.usr;`);
-        expect(got)
-            .to.deep.equal([
-                { usr: 'you', friend: 'you' }
-                , { usr: 'you', friend: 'other1' }
-                , { usr: 'me', friend: 'me' }
-                , { usr: 'me', friend: 'other2' }
-            ])
+
+    describe('self joins', () => {
+        beforeEach(() => {
+            none(`create table test(usr text, friend text);
+                    insert into test values ('me', 'you');
+                    insert into test values ('me', 'other1');
+                    insert into test values ('you', 'me');
+                    insert into test values ('you', 'other2');`);
+        })
+
+
+        it('self join with *', () => {
+            const got = many(`select * from
+                                test a
+                                join test b on a.friend = b.usr;`);
+            expect(got)
+                .to.deep.equal([
+                    // nb: this is not exactly the same order as we'd get with pg
+                    //   (but there is no order clause)
+                    { usr: 'me', friend: 'you', usr1: 'you', friend1: 'me' },
+                    { usr: 'me', friend: 'you', usr1: 'you', friend1: 'other2' },
+                    { usr: 'you', friend: 'me', usr1: 'me', friend1: 'you' },
+                    { usr: 'you', friend: 'me', usr1: 'me', friend1: 'other1' },
+                ])
+        })
+
+
+        it('can self right join', () => {
+            const got = many(`select a.usr, b.friend from
+                                test a
+                                right join test b on a.friend = b.usr;`);
+            expect(got)
+                .to.deep.equal([
+                    { usr: 'you', friend: 'you' }
+                    , { usr: 'you', friend: 'other1' }
+                    , { usr: 'me', friend: 'me' }
+                    , { usr: 'me', friend: 'other2' }
+                ])
+        })
+
+        it('can self left join', () => {
+            const got = many(`select a.usr, b.friend from
+                                test a
+                                left join test b on a.friend = b.usr;`);
+            expect(got)
+                .to.deep.equal([
+                    { usr: 'me', friend: 'me' },
+                    { usr: 'me', friend: 'other2' },
+                    { usr: 'me', friend: null },
+                    { usr: 'you', friend: 'you' },
+                    { usr: 'you', friend: 'other1' },
+                    { usr: 'you', friend: null },
+                ])
+        });
+
+        it('can self inner join', () => {
+            const got = many(`select a.usr, b.friend from
+                                test a
+                                join test b on a.friend = b.usr;`);
+            expect(got)
+                .to.deep.equal([
+                    { usr: 'me', friend: 'me' },
+                    { usr: 'me', friend: 'other2' },
+                    { usr: 'you', friend: 'you' },
+                    { usr: 'you', friend: 'other1' },
+                ])
+        });
+
     })
 
-    it ('can self left join', () => {
-        const got = many(`create table test(usr text, friend text);
-        insert into test values ('me', 'you');
-        insert into test values ('me', 'other1');
-        insert into test values ('you', 'me');
-        insert into test values ('you', 'other2');
-        select a.usr, b.friend from
-            test a
-            left join test b on a.friend = b.usr;`);
-        expect(got)
-            .to.deep.equal([
-                { usr: 'me', friend: 'me' },
-                { usr: 'me', friend: 'other2' },
-                { usr: 'me', friend: null },
-                { usr: 'you', friend: 'you' },
-                { usr: 'you', friend: 'other1' },
-                { usr: 'you', friend: null },
-            ])
+    it('can select * and column on join', () => {
+        expect(many(`select *, a from concat('a') as a join concat('a') as b on a.a=b.b`))
+            .to.deep.equal([{ a: 'a', b: 'a', a1: 'a' }]);
+    })
+
+    it('can select selective * and column on join ', () => {
+        expect(many(`select b.*, vala, a from (values ('x', 'a1')) as a(ida, vala) join (values ('x', 'b1')) as b(idb, valb) on a.ida=b.idb`))
+            .to.deep.equal([{
+                idb: 'x',
+                valb: 'b1',
+                vala: 'a1',
+                a: {
+                    ida: 'x',
+                    vala: 'a1',
+                },
+            }]);
     });
 
-    it ('can self inner join', () => {
-        const got = many(`create table test(usr text, friend text);
-        insert into test values ('me', 'you');
-        insert into test values ('me', 'other1');
-        insert into test values ('you', 'me');
-        insert into test values ('you', 'other2');
-        select a.usr, b.friend from
-            test a
-            join test b on a.friend = b.usr;`);
-        expect(got)
-            .to.deep.equal([
-                { usr: 'me', friend: 'me' },
-                { usr: 'me', friend: 'other2' },
-                { usr: 'you', friend: 'you' },
-                { usr: 'you', friend: 'other1' },
-            ])
-    });
+
+    it('[bugfix] performs typeorm schema exploration join', () => {
+        many(`SELECT "ns"."nspname" AS "table_schema", "t"."relname" AS "table_name", "cnst"."conname" AS "constraint_name", pg_get_constraintdef("cnst"."oid") AS "expression", CASE "cnst"."contype" WHEN 'p' THEN 'PRIMARY' WHEN 'u' THEN 'UNIQUE' WHEN 'c' THEN 'CHECK' WHEN 'x' THEN 'EXCLUDE' END AS "constraint_type", "a"."attname" AS "column_name" FROM "pg_constraint" "cnst" INNER JOIN "pg_class" "t" ON "t"."oid" = "cnst"."conrelid" INNER JOIN "pg_namespace" "ns" ON "ns"."oid" = "cnst"."connamespace" LEFT JOIN "pg_attribute" "a" ON "a"."attrelid" = "cnst"."conrelid" AND "a"."attnum" = ANY ("cnst"."conkey") WHERE "t"."relkind" IN ('r', 'p') AND (("ns"."nspname" = 'public' AND "t"."relname" = 'user') OR ("ns"."nspname" = 'public' AND "t"."relname" = 'form') OR ("ns"."nspname" = 'public' AND "t"."relname" = 'submission'));`);
+    })
+
 
     // it ('can full join', () => {
     //     photos();

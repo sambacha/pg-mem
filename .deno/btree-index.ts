@@ -1,4 +1,4 @@
-import { IValue, _IIndex, _ITable, getId, IndexKey, CreateIndexColDef, _Transaction, _Explainer, _IndexExplanation, IndexExpression, IndexOp, Stats } from './interfaces-private.ts';
+import { IValue, _IIndex, _ITable, getId, IndexKey, CreateIndexColDef, _Transaction, _Explainer, _IndexExplanation, IndexExpression, IndexOp, Stats, _INamedIndex, Reg, _ISchema } from './interfaces-private.ts';
 // @ts-ignore
 import createTree from 'https://deno.land/x/functional_red_black_tree@1.0.1-deno/mod.ts';
 import { QueryError, NotSupported, nil } from './interfaces.ts';
@@ -49,8 +49,13 @@ interface BIterator<T> {
 }
 
 type RawTree<T> = BTree<ImMap<string, T>>;;
-export class BIndex<T = any> implements _IIndex<T> {
+export class BIndex<T = any> implements _INamedIndex<T> {
 
+    get type(): 'index' {
+        return 'index';
+    }
+
+    readonly reg: Reg;
 
     // private asBinary: RawTree;
     expressions: (IndexExpression & IValue)[];
@@ -58,18 +63,27 @@ export class BIndex<T = any> implements _IIndex<T> {
     private treeCountId = Symbol();
 
 
+    get ownerSchema(): _ISchema {
+        return this.onTable.ownerSchema;
+    }
+
     constructor(t: _Transaction
+        , readonly name: string
         , private cols: CreateIndexColDef[]
         , readonly onTable: _ITable<T>
         , readonly hash: string
-        , public indexName: string
         , readonly unique: boolean
         , readonly notNull: boolean) {
+        this.reg = onTable.ownerSchema._reg_register(this);
         const asBinary = createTree((a: any, b: any) => {
             return this.compare(a, b);
         });
         this.setBin(t, asBinary);
         this.expressions = cols.map(x => x.value);
+    }
+
+    drop(t: _Transaction): void {
+        this.onTable.dropIndex(t, this.name);
     }
 
     compare(_a: any, _b: any) {
@@ -99,6 +113,10 @@ export class BIndex<T = any> implements _IIndex<T> {
         return this.expressions.map(k => k.get(raw, t));
     }
 
+    dropFromData(t: _Transaction) {
+        t.delete(this.treeBinId);
+    }
+
     private bin(t: _Transaction) {
         return t.get<RawTree<T>>(this.treeBinId);
     }
@@ -122,11 +140,18 @@ export class BIndex<T = any> implements _IIndex<T> {
         // build key and object id
         const id = getId(raw);
         const key = this.buildKey(raw, t);
-        if (this.notNull && key.some(x => x === null || x === undefined)) {
-            throw new QueryError('Cannot add a null record in index ' + this.indexName);
+        if (this.notNull && key.some(x => nullIsh(x))) {
+            throw new QueryError('Cannot add a null record in index ' + this.name);
         }
         if (this.unique && this.hasKey(key, t)) {
-            throw new QueryError('Unique constraint violated while adding a record to index ' + this.indexName);
+            const idCols = this.cols.map(it => it.value.id);
+            throw new QueryError({
+                error: `insert into "${this.onTable.name}" (${Object.keys(raw).join(', ')}) `
+                    + `values (${Object.keys(raw).map((_, i) => `$${i + 1}`).join(', ')}) returning "${idCols}" `
+                    + `- duplicate key value violates unique constraint "${this.onTable.name}_pkey"`,
+                details: `Key (${idCols})=(${key}) already exists.`,
+                code: '23505'
+            });
         }
         // get tree
         let tree = this.bin(t);
@@ -463,7 +488,7 @@ export class BIndex<T = any> implements _IIndex<T> {
         return {
             _: 'btree',
             onTable: this.onTable.name,
-            btree: this.expressions.map(x => x.sql!),
+            btree: this.expressions.map(x => x.id!),
         }
     }
 }

@@ -1,5 +1,5 @@
 import { _IIndex, IValue, _ITable, _IDb, _Transaction, _Explainer, _IndexExplanation, IndexOp, IndexKey, Stats } from '../interfaces-private';
-import { ReadOnlyError, NotSupported } from '../interfaces';
+import { PermissionDeniedError, NotSupported } from '../interfaces';
 
 export class TableIndex implements _IIndex {
     readonly expressions: IValue<any>[];
@@ -28,12 +28,13 @@ export class TableIndex implements _IIndex {
     }
 
     entropy(op: IndexOp): number {
-        return this.onTable.schema.tablesCount(op.t);
+        return this.onTable.db.listSchemas()
+            .reduce((tot, s) => tot + s.tablesCount(op.t) * 10 * 3, 0);
     }
 
 
     add(raw: any): void {
-        throw new ReadOnlyError('tables');
+        throw new PermissionDeniedError('tables');
     }
 
     eqFirst([key]: any, t: _Transaction) {

@@ -2,12 +2,11 @@ import 'mocha';
 import 'chai';
 import { newDb } from '../db';
 import { expect, assert } from 'chai';
-import { IMemoryDb } from '../interfaces';
 import { preventSeqScan } from './test-utils';
 import { Types } from '../datatypes';
 import { _IDb } from '../interfaces-private';
 
-describe('[Queries] Indices', () => {
+describe('Indices', () => {
 
     let db: _IDb;
     let many: (str: string) => any[];
@@ -28,12 +27,12 @@ describe('[Queries] Indices', () => {
             fields: [{
                 name: 'id',
                 type: Types.text(),
-                constraint: { type: 'primary key' },
+                constraints: [{ type: 'primary key' }],
             }, {
                 name: 'str',
                 type: Types.text(),
             }, {
-                name: 'otherStr',
+                name: 'otherstr',
                 type: Types.text(),
             }],
         });
@@ -56,13 +55,13 @@ describe('[Queries] Indices', () => {
         const db = setupNulls();
         preventSeqScan(db);
         const got = many('select * from data where str is null');
-        expect(got).to.deep.equal([{ id: 'id1', str: null, otherStr: null }, { id: 'id3', str: null, otherStr: null }]);
+        expect(got).to.deep.equal([{ id: 'id1', str: null, otherstr: null }, { id: 'id3', str: null, otherstr: null }]);
     });
 
     it('returns something on seqscan for is null', () => {
         const db = setupNulls(false);
         const got = many('select * from data where str is null');
-        expect(got).to.deep.equal([{ id: 'id1', str: null, otherStr: null }, { id: 'id3', str: null, otherStr: null }]);
+        expect(got).to.deep.equal([{ id: 'id1', str: null, otherstr: null }, { id: 'id3', str: null, otherstr: null }]);
     });
 
 
@@ -84,6 +83,53 @@ describe('[Queries] Indices', () => {
     it('primary index does not allow null values', () => {
         none(`create table test(id text primary key);`);
         assert.throws(() => none(`insert into test values (null)`));
+    });
+
+
+    it('can unique index', () => {
+        none(`create table test(col text);
+            create unique index idx1 on test(col);
+            insert into test values ('one'), ('two')`);
+
+        assert.throws(() => none(`insert into test values ('one')`), /constraint/);
+    });
+
+
+    it('can create the same named index twice', () => {
+        none(`create table test(col text);
+            create index idx1 on test(col);
+            create index idx2 on test(col);`);
+    });
+
+
+    it('can create index if not exists', () => {
+        none(`create table test(col text);
+            create index idxname on test(col);
+            create index if not exists idxname on test(col);`);
+    });
+
+
+    it('reads .ifNotExists when creating index', () => {
+        none(`create table test(col text);
+            create index if not exists idxname on test(col);`);
+    });
+
+    it('cannot create index twice', () => {
+        none(`create table test(col text);
+            create index idxname on test(col);`);
+        assert.throws(() => none(`create index idxname on test(col)`), /exists/);
+    });
+
+    it('cannot create index which has same name as a table', () => {
+        none(`create table test(col text);`);
+        assert.throws(() => none(`create index test on test(col)`), /exists/);
+    });
+
+
+    it('can create the same anonymous index twice', () => {
+        none(`create table test(col text);
+            create index on test(col);
+            create index on test(col);`);
     });
 
 
@@ -292,6 +338,25 @@ describe('[Queries] Indices', () => {
         preventSeqScan(db); // <== should use index even if index is on expression
         expect(many(`select id from test where a+b=42`).map(x => x.id)).to.deep.equal(['id1', 'id3']);
     });
+
+    it('can use implicit cast index on index', () => {
+        expect(many(`create table example(id int primary key);
+                insert into example(id) values (1);
+                select * from example where id='1';`))
+            .to.deep.equal([
+                { id: 1 }
+            ]);
+        expect(many(`select * from example where id>'0';`))
+            .to.deep.equal([
+                { id: 1 }
+            ]);
+        expect(many(`select * from example where id<'3';`))
+            .to.deep.equal([
+                { id: 1 }
+            ]);
+        expect(many(`select * from example where id>'1';`))
+            .to.deep.equal([]);
+    })
 
 
     describe('Indexes on comparisons', () => {
