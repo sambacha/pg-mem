@@ -53,6 +53,10 @@ describe('Simple queries', () => {
         expect(got).to.deep.equal([]);
     });
 
+    it('supports "set" statement', () => {
+        none(`set session_replication_role = 'replica';`);
+    })
+
 
     it('can select twice the same colmun', () => {
         simpleDb();
@@ -63,6 +67,22 @@ describe('Simple queries', () => {
                 id1: 'key',
             }]);
     });
+
+
+    it('supports inner request (bugfix)', () => {
+        // this used to throw:
+        many(`
+        create table duplicate_hash(dispute_id text, hash text, primary key(dispute_id, hash));
+                select
+                count(dispute_id) cnt
+            from duplicate_hash dh
+            where dh.hash in (select
+                        dhi.hash
+                        from duplicate_hash dhi
+                        where dhi.dispute_id = 'CFR-210419-DMMM')
+                and dh.dispute_id!='CFR-210419-DMMM';
+        `);
+    })
 
     it('can select NOT', () => {
         expect(many(`select not true as v`))
@@ -128,8 +148,28 @@ describe('Simple queries', () => {
 
 
 
+    it('OR bugfix when there is a null column', () => {
+        expect(many(`CREATE TABLE IF NOT EXISTS test(
+                id varchar(100) not null,
+                val text
+            );
+
+            INSERT INTO test(id, val) VALUES ('a', null), ('b', 'row b');
+
+            SELECT *  FROM test
+                    WHERE id in ('a', 'b') OR val = 'SOMETHING_IRRELEVANT';`))
+            .to.deep.equal([{ id: 'a', val: null }, { id: 'b', val: 'row b' }]);
+    });
+
+
     it('insert returning', () => {
         expect(many(`create table test(id serial primary key, val text, nl text);
+                                insert into test(val) values ('a'), ('b') returning id, val;`))
+            .to.deep.equal([{ id: 1, val: 'a' }, { id: 2, val: 'b' }]);
+    });
+
+    it('supports bigserial data type', () => {
+        expect(many(`create table test(id bigserial primary key, val text, nl text);
                                 insert into test(val) values ('a'), ('b') returning id, val;`))
             .to.deep.equal([{ id: 1, val: 'a' }, { id: 2, val: 'b' }]);
     });

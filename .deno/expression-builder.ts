@@ -59,9 +59,6 @@ function _buildValue(data: _ISelection | nil, val: Expr): IValue {
 }
 
 function _buildValueReal(data: _ISelection, val: Expr): IValue {
-    if (!data) {
-        debugger;
-    }
     switch (val.type) {
         case 'binary':
             if (val.op === 'IN' || val.op === 'NOT IN') {
@@ -206,44 +203,65 @@ function buildBinary(data: _ISelection, val: ExprBinary): IValue {
 }
 
 export function buildBinaryValue(data: _ISelection, leftValue: IValue, op: BinaryOperator, rightValue: IValue): IValue {
-    const type: _IType = reconciliateTypes([leftValue, rightValue]);
-    leftValue = leftValue.convert(type);
-    rightValue = rightValue.convert(type);
+    function expectSame() {
+        const type: _IType = reconciliateTypes([leftValue, rightValue]);
+        leftValue = leftValue.convert(type);
+        rightValue = rightValue.convert(type);
+        return type;
+    }
+    function expectBoth(t: _IType) {
+        leftValue = leftValue.convert(t);
+        rightValue = rightValue.convert(t);
+    }
 
     let getter: (a: any, b: any) => any;
     let returnType: _IType = Types.bool;
     let commutative = true;
     let forcehash: any = null;
+    let rejectNils = true;
     switch (op) {
-        case '=':
+        case '=': {
+            const type = expectSame();
             getter = (a, b) => type.equals(a, b);
             break;
-        case '!=':
+        }
+        case '!=': {
+            const type = expectSame();
             getter = (a, b) => {
                 const ret = type.equals(a, b);
                 return nullIsh(ret) ? null : !ret;
             };
             break;
-        case '>':
+        }
+        case '>': {
+            const type = expectSame();
             getter = (a, b) => type.gt(a, b);
             forcehash = { op: '>', left: leftValue.hash, right: rightValue.hash };
             break;
-        case '<':
+        }
+        case '<': {
+            const type = expectSame();
             getter = (a, b) => type.lt(a, b);
             forcehash = { op: '>', left: rightValue.hash, right: leftValue.hash };
             break;
-        case '>=':
+        }
+        case '>=': {
+            const type = expectSame();
             getter = (a, b) => type.ge(a, b);
             forcehash = { op: '>=', left: leftValue.hash, right: rightValue.hash };
             break;
-        case '<=':
+        }
+        case '<=': {
+            const type = expectSame();
             getter = (a, b) => type.le(a, b);
             forcehash = { op: '>=', left: rightValue.hash, right: leftValue.hash };
             break;
+        }
         case '+':
         case '-':
         case '*':
-        case '/':
+        case '/': {
+            const type = expectSame();
             if (!isNumeric(type)) {
                 throw new QueryError(`Cannot apply ${op} on non numeric type ${type.primary}`);
             }
@@ -269,11 +287,11 @@ export function buildBinaryValue(data: _ISelection, leftValue: IValue, op: Binar
                     break;
             }
             break;
+        }
         case 'AND':
         case 'OR':
-            leftValue = leftValue.convert(Types.bool);
-            rightValue = rightValue.convert(Types.bool);
-
+            expectBoth(Types.bool);
+            rejectNils = false;
             if (op === 'AND') {
                 getter = (a, b) => a && b;
             } else {
@@ -281,9 +299,18 @@ export function buildBinaryValue(data: _ISelection, leftValue: IValue, op: Binar
             }
             break;
         case '@>':
+            expectBoth(Types.jsonb);
             getter = (a, b) => queryJson(b, a);
             break;
+        case '&&':
+            if (leftValue.type.primary !== DataType.array || !rightValue.canConvert(leftValue.type)) {
+                throw new QueryError(`Operator does not exist: ${leftValue.type.name} && ${rightValue.type.name}`, '42883');
+            }
+            rightValue = rightValue.convert(leftValue.type);
+            getter = (a, b) => a.some((element: any) => b.includes(element));
+            break;
         case '||':
+            expectBoth(Types.text());
             getter = (a, b) => a + b;
             returnType = Types.text();
             break;
@@ -291,6 +318,7 @@ export function buildBinaryValue(data: _ISelection, leftValue: IValue, op: Binar
         case 'ILIKE':
         case 'NOT LIKE':
         case 'NOT ILIKE':
+            expectBoth(Types.text());
             const caseSenit = op === 'LIKE' || op === 'NOT LIKE';
             const not = op === 'NOT ILIKE' || op === 'NOT LIKE';
             if (rightValue.isConstant) {
@@ -354,7 +382,7 @@ export function buildBinaryValue(data: _ISelection, leftValue: IValue, op: Binar
         , (raw, t) => {
             const leftRaw = leftValue.get(raw, t);
             const rightRaw = rightValue.get(raw, t);
-            if (nullIsh(leftRaw) || nullIsh(rightRaw)) {
+            if (rejectNils && (nullIsh(leftRaw) || nullIsh(rightRaw))) {
                 return null;
             }
             return getter(leftRaw, rightRaw);
@@ -592,14 +620,16 @@ function buildSelectAsArray(data: _ISelection, op: SelectStatement): IValue {
         , onData.columns[0].type.asList()
         , null
         , Math.random().toString() // must not be indexable => always different hash
-        , onData.columns[0]
+        , null // , onData.columns[0]
         , (raw, t) => {
             const ret = [];
             for (const v of onData.enumerate(t!)) {
                 ret.push(onData.columns[0].get(v, t));
             }
             return ret;
-        });
+        }, {
+        forceNotConstant: true
+    });
 }
 
 

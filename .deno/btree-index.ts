@@ -75,10 +75,7 @@ export class BIndex<T = any> implements _INamedIndex<T> {
         , readonly unique: boolean
         , readonly notNull: boolean) {
         this.reg = onTable.ownerSchema._reg_register(this);
-        const asBinary = createTree((a: any, b: any) => {
-            return this.compare(a, b);
-        });
-        this.setBin(t, asBinary);
+        this.truncate(t);
         this.expressions = cols.map(x => x.value);
     }
 
@@ -113,6 +110,13 @@ export class BIndex<T = any> implements _INamedIndex<T> {
         return this.expressions.map(k => k.get(raw, t));
     }
 
+    truncate(t: _Transaction) {
+        const asBinary = createTree((a: any, b: any) => {
+            return this.compare(a, b);
+        });
+        this.setBin(t, asBinary);
+    }
+
     dropFromData(t: _Transaction) {
         t.delete(this.treeBinId);
     }
@@ -144,7 +148,14 @@ export class BIndex<T = any> implements _INamedIndex<T> {
             throw new QueryError('Cannot add a null record in index ' + this.name);
         }
         if (this.unique && this.hasKey(key, t)) {
-            throw new QueryError('Unique constraint violated while adding a record to index ' + this.name);
+            const idCols = this.cols.map(it => it.value.id);
+            throw new QueryError({
+                error: `insert into "${this.onTable.name}" (${Object.keys(raw).join(', ')}) `
+                    + `values (${Object.keys(raw).map((_, i) => `$${i + 1}`).join(', ')}) returning "${idCols}" `
+                    + `- duplicate key value violates unique constraint "${this.onTable.name}_pkey"`,
+                details: `Key (${idCols})=(${key}) already exists.`,
+                code: '23505'
+            });
         }
         // get tree
         let tree = this.bin(t);

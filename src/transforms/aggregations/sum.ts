@@ -1,8 +1,8 @@
 import { AggregationComputer, AggregationGroupComputer, IValue, nil, QueryError, _ISelection, _IType, _Transaction } from '../../interfaces-private';
-import { Expr, ExprCall } from 'pgsql-ast-parser';
+import { ExprCall } from 'pgsql-ast-parser';
 import { buildValue } from '../../expression-builder';
 import { Types } from '../../datatypes';
-import { asSingleQName, nullIsh } from '../../utils';
+import { nullIsh } from '../../utils';
 
 
 class SumExpr implements AggregationComputer<number> {
@@ -59,7 +59,7 @@ export function buildSum(this: void, base: _ISelection, call: ExprCall) {
 
     if (call.distinct) {
         if (args.length !== 1) {
-            throw new QueryError('"sum distinct" only takes one artgument');
+            throw new QueryError('"sum distinct" only takes one argument');
         }
         const distinctArg = buildValue(base, args[0]);
         return new SumDistinct(distinctArg);
