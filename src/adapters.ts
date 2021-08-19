@@ -32,6 +32,7 @@ function toLiteral(val: any): string {
                 return 'null';
             }
             if (Array.isArray(val)) {
+                if (val.length === 0) return `'{}'`;
                 return `ARRAY[${val.map(x => toLiteral(x)).join(', ')}]`;
             }
             if (val instanceof Date) {
@@ -48,6 +49,7 @@ function toLiteral(val: any): string {
 }
 
 export class Adapters implements LibAdapters {
+    private _mikroPatched?: boolean;
 
     constructor(private db: IMemoryDb) {
     }
@@ -126,16 +128,24 @@ export class Adapters implements LibAdapters {
                 }
             }
 
-            private adaptResults(query: PgQuery, rows: QueryResult) {
+            private adaptResults(query: PgQuery, res: QueryResult) {
                 if (query.rowMode) {
-                    throw new NotSupported('pg rowMode')
+                    throw new NotSupported('pg rowMode');
                 }
                 return {
-                    ...rows,
+                    ...res,
+                    // clone rows to avoid leaking symbols
+                    rows: res.rows.map(row => {
+                        return Object.entries(row).reduce((obj, [key, val]) => {
+                            obj[key] = val;
+                            return obj;
+                        }, {} as any);
+                    }),
                     get fields() {
-                        throw new NotSupported('get pg fields');
+                        // to implement if needed ? (never seen a lib that uses it)
+                        return [];
                     }
-                }
+                };
             }
 
             private adaptQuery(query: string | PgQuery, values: any): PgQuery {
@@ -285,14 +295,56 @@ export class Adapters implements LibAdapters {
         }
     }
 
-    createKnex(queryLatency?: number): any {
+    createKnex(queryLatency?: number, knexConfig?: object): any {
         const knex = __non_webpack_require__('knex')({
-            client: 'pg',
             connection: {},
+            ...knexConfig,
+            client: 'pg',
         });
         knex.client.driver = this.createPg(queryLatency);
         knex.client.version = 'pg-mem';
         return knex;
+    }
+
+
+    async createMikroOrm(mikroOrmOptions: any, queryLatency?: number) {
+
+        const { MikroORM } = __non_webpack_require__('@mikro-orm/core');
+        const { AbstractSqlDriver, PostgreSqlConnection, PostgreSqlPlatform } = __non_webpack_require__('@mikro-orm/postgresql');
+        const that = this;
+
+        // see https://github.com/mikro-orm/mikro-orm/blob/aa71065d0727920db7da9bfdecdb33e6b8165cb5/packages/postgresql/src/PostgreSqlConnection.ts#L5
+        class PgMemConnection extends PostgreSqlConnection {
+            protected createKnexClient(type: string) {
+                return that.createKnex();
+            }
+
+        }
+        // see https://github.com/mikro-orm/mikro-orm/blob/master/packages/postgresql/src/PostgreSqlDriver.ts
+        class PgMemDriver extends AbstractSqlDriver<PgMemConnection> {
+            constructor(config: any) {
+                super(config, new PostgreSqlPlatform(), PgMemConnection, ['knex', 'pg']);
+            }
+        }
+
+        // hack: this query is not supported by pgsql-ast-parser
+        if (!this._mikroPatched) {
+            this.db.public.interceptQueries(q => {
+                if (q === `set names 'utf8';`) {
+                    return [];
+                }
+                return null;
+            });
+            this._mikroPatched = true;
+        }
+
+
+        const orm = await MikroORM.init({
+            ...mikroOrmOptions,
+            dbName: 'public',
+            driver: PgMemDriver,
+        });
+        return orm;
     }
 
 }

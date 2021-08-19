@@ -12,7 +12,7 @@ export type Schema = {
 
 
 export interface SchemaField extends Omit<CreateColumnDef, 'dataType' | 'kind' | 'name'> {
-    type: IType;
+    type: IType | DataType;
     name: string;
     serial?: boolean;
 }
@@ -22,6 +22,9 @@ export interface IType {
     readonly primary: DataType;
     readonly name: string;
     toString(): string;
+
+    /** Create an array type of this type */
+    asArray(): IType;
 }
 
 // todo support all types https://www.postgresql.org/docs/9.5/datatype.html
@@ -134,6 +137,8 @@ export interface IMemoryDb {
     registerLanguage(languageName: string, compiler: LanguageCompiler): this;
 }
 
+export type QueryInterceptor = (query: string) => any[] | nil;
+
 
 export type ArgDef = DataType | IType | ArgDefDetails;
 
@@ -203,7 +208,10 @@ export interface LibAdapters {
     createTypeormConnection(typeOrmConnection: any, queryLatency?: number): any;
 
     /** Create a Knex.js instance bound to this db */
-    createKnex(queryLatency?: number): any;
+    createKnex(queryLatency?: number, knexConfig?: object): any;
+
+    /** Create a mikro-orm instance bound to this db */
+    createMikroOrm(mikroOrmOptions: any, queryLatency?: number): Promise<any>
 }
 
 export interface ISchema {
@@ -246,6 +254,9 @@ export interface ISchema {
     /** Register a simple type, which is equivalent to another */
     registerEquivalentType(type: IEquivalentType): IType;
 
+    /** Get an existing type */
+    getType(name: DataType): IType;
+
     /**
      * Registers an enum type on this schema
      * @param name Enum name
@@ -258,6 +269,14 @@ export interface ISchema {
      * ⚠ Only working when runnin nodejs !
      */
     migrate(config?: IMigrate.MigrationParams): Promise<void>;
+
+
+    /**
+     * Intecept queries.
+     * If your interceptor returns an array, then the query will not be executed.
+     * The given result will be returned instead.
+     */
+    interceptQueries(interceptor: QueryInterceptor): ISubscription;
 }
 
 export interface FunctionDefinition {
@@ -349,14 +368,14 @@ interface ErrorData {
     readonly error: string;
     readonly details?: string;
     readonly hint?: string;
-    readonly code?: number;
+    readonly code?: string;
 }
 export class QueryError extends Error {
     readonly data: ErrorData;
-    constructor(err: string | ErrorData) {
+    constructor(err: string | ErrorData, code?: string) {
         super(typeof err === 'string' ? err : errDataToStr(err));
         this.data = typeof err === 'string'
-            ? { error: err }
+            ? { error: err, code }
             : err;
     }
 }

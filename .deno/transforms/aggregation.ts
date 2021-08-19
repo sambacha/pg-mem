@@ -9,9 +9,10 @@ import { Evaluator } from '../evaluator.ts';
 import { buildCount } from './aggregations/count.ts';
 import { buildMinMax } from './aggregations/max-min.ts';
 import { buildSum } from './aggregations/sum.ts';
+import { buildArrayAgg } from './aggregations/array_agg.ts';
+import { buildAvg } from './aggregations/avg.ts';
 
 export const aggregationFunctions = new Set([
-    'array_agg',
     'array_agg',
     'avg',
     'bit_and',
@@ -191,8 +192,13 @@ export class Aggregation<T> extends TransformBase<T> implements _ISelection<T> {
                 g.computer.feedItem(item);
             }
         }
-        // if this.base is empty
-        if (groups.size === 0) {
+
+        // if this.base is empty, and this is not a group by...
+        //  👉 Must return a result.
+        //   ex:
+        //      - select max(a) from empty              👉 [{max: null}]
+        //      - select max(a) from empty group by id  👉 []
+        if (groups.size === 0 && !this.groupedBy.length) {
             const key: IndexKey = this.groupedBy.map(() => null);
             const groupingKey = hash(key);
             groups.set(groupingKey, {
@@ -296,6 +302,10 @@ export class Aggregation<T> extends TransformBase<T> implements _ISelection<T> {
                 return buildMinMax(this.base, call.args, name);
             case 'sum':
                 return buildSum(this.base, call);
+            case 'array_agg':
+                return buildArrayAgg(this.base, call);
+            case 'avg':
+                return buildAvg(this.base, call);
             default:
                 throw new NotSupported('aggregation function ' + name);
         }
